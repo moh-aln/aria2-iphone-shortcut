@@ -65,7 +65,7 @@ trap 'kill $server; pkill -f "$tmp"; pkill -f "$here/dl --work"; pkill -f "$here
 # Alpine's BusyBox has nohup, pgrep and pkill; Ubuntu's doesn't, so those come from the system.
 # aria2c and yt-dlp are slowed down so a download is still running when the checks look at it.
 mkdir "$tmp/bin"
-for tool in busybox sh awk base64 cat cp cut date dd du find grep head ls mkdir mv od rm rmdir sed seq setsid sha256sum sleep sort stat tail timeout tr wc; do
+for tool in busybox sh awk base64 cat cp cut date dd df du find grep head ls mkdir mv od rm rmdir sed seq setsid sha256sum sleep sort stat tail timeout tr uname wc; do
   ln -s "$(command -v busybox)" "$tmp/bin/$tool"
 done
 for tool in nohup pgrep pkill kill curl ffmpeg python3; do ln -s "$(command -v $tool)" "$tmp/bin/$tool"; done
@@ -122,6 +122,9 @@ check "says so when there is no link" "$out" "No link found"
 sleep 8
 [ ! -e "$tmp/PWNED" ] && [ ! -e "$tmp/PWNED2" ] && echo "ok    shell syntax in a link is never run" ||
   { echo "FAIL  shell syntax in a link ran"; fails=$((fails + 1)); }
+for try in $(seq 20); do [ -s "$DL_SHARE/aria2-debug.txt" ] && break; sleep 1; done
+check "a failed download leaves a debug report in Files" "$(cat "$DL_SHARE/aria2-debug.txt" 2>/dev/null)" "aria2 debug report · "
+check "...with that download's log" "$(cat "$DL_SHARE/aria2-debug.txt" 2>/dev/null)" ": failed ("
 check "a file link goes to aria2" "$(log_of 2)" "=== via aria2"
 check "a magnet goes to aria2" "$(log_of 5)" "=== via aria2"
 check "a web page goes to yt-dlp" "$(log_of 6)" "=== via yt-dlp"
@@ -250,6 +253,8 @@ check "ui: Settings: notifications" "$screen" "🔕 Notifications · Off · tap 
 check "ui: Settings: aria2's own updates" "$screen" "⬆️ aria2 and its shortcut · Up to date · checked "
 check "ui: Settings: the tools' updates, separately" "$screen" "🔧 Tools: yt-dlp, aria2, ffmpeg · Updated "
 check "ui: Settings: open iSH-AOK" "$(tap '📲')" "@@app"
+check "ui: Settings: a debug report, saved for a shortcut that can't copy" "$(tap '🐞 Save a debug report')" "ℹ️ Saved a debug report"
+check "yt-dlp writes its versions and steps in the log" "$(log_of 6)" "[debug] yt-dlp version "
 mkdir "$DL_DIR/.logs/.updating"
 printf '=== update now\n=== step 1 Alpine packages\n=== step 2 yt-dlp\n' >"$DL_DIR/.logs/.update.log"
 check "ui: a tools update shows its progress" "$(ui '')" "🔧 Tools: yt-dlp, aria2, ffmpeg · Updating · 2 of 2: yt-dlp ▰▰▰▰▰▱▱▱▱▱"
@@ -392,6 +397,7 @@ printf 'first\n' >"$tmp/www/again.txt"
 printf 'second\n' >"$tmp/www/note2.txt"
 dl "$AGAIN" >/dev/null
 dl "http://127.0.0.1:$port/rabbit3.mp4" >/dev/null  # about 16 s at 50K/s: something to watch
+dl "http://127.0.0.1:$port/gone.mp4" >/dev/null     # fails: something to report
 for try in $(seq 30); do line_for again.txt | grep -q ✅ && break; sleep 1; done
 u3 @@start >/dev/null
 cards=$(u3 Downloads)
@@ -445,6 +451,19 @@ check "level 3: deleting a file in Files asks first" "$(u3 'Delete the file…')
 check "...then deletes it" "$(u3 'Yes, delete it')" "N;CHARSET=utf-8:Deleted again (2).txt;;;;"
 [ ! -e "$DL_SHARE/again (2).txt" ] && [ -e "$DL_SHARE/again.txt" ] && ok "...and only that file" ||
   fail "deleting went wrong: $(ls "$DL_SHARE")"
+for try in $(seq 30); do line_for gone.mp4 | grep -q ⚠️ && break; sleep 1; done
+gid=$(line_for gone.mp4 | sed 's/.*#//')
+u3 '' >/dev/null
+cards=$(u3 'gone.mp4')
+check "level 3: a failed download offers a debug report" "$cards" "N;CHARSET=utf-8:Copy a debug report;;;;"
+out=$(u3 'Copy a debug report')
+check "...which is copied" "$(printf '%s\n' "$out" | head -n 1)" "@@copy:aria2 debug report · "
+check "...with its log" "$out" "== Download #$gid: failed"
+check "...and its settings, but not the Bark key or the live view's token" "$out" "Settings: notifications "
+case $out in *GOODKEY42* | *"$token"*) fail "the report gave away a secret" ;; *) ok "the report keeps secrets out" ;; esac
+check "...then says so" "$(u3 '')" "N;CHARSET=utf-8:Copied a debug report;;;;"
+check "the live view shows the report, ready to copy" "$(web "/report/$gid?t=$token")" "Copy the report</button>"
+check "...the same report" "$(web "/report/$gid?t=$token")" "== Download #$gid: failed"
 
 # Notifications, through the stand-in for Bark's server.
 [ ! -e "$tmp/bark.log" ] && ok "no notifications before they're turned on" ||

@@ -69,6 +69,7 @@ cat >/usr/local/bin/dl.new <<'DL_SCRIPT'
 #   dl -p | -r | -c       pause all, resume all, clear finished from the list (files stay)
 #   dl -u | -v            update aria2 and its tools now | show the tools' versions
 #   dl <Bark link>        get a notification when a download ends, through the Bark app
+#   dl --report [<id>]    a debug report, to send for help when a download goes wrong
 #
 # Finished downloads land in /root/Downloads, or in /mnt/phone when a Files folder is
 # mounted there (see SHARE below).
@@ -126,8 +127,9 @@ is_video_site() {
 
 # Is <pid> the worker of download <id>, and not a zombie?
 alive() {
-  [ -n "$1" ] && [ -r "/proc/$1/stat" ] && read -r _ _ state _ <"/proc/$1/stat" &&
-    [ "$state" != Z ] && tr '\0' ' ' <"/proc/$1/cmdline" | grep -q -- "--work $2 *\$"
+  # pstate, not state: load's callers read $state afterwards.
+  [ -n "$1" ] && [ -r "/proc/$1/stat" ] && read -r _ _ pstate _ <"/proc/$1/stat" &&
+    [ "$pstate" != Z ] && tr '\0' ' ' <"/proc/$1/cmdline" | grep -q -- "--work $2 *\$"
 }
 
 running() { alive "$(cat "$JOBS/$1.pid" 2>/dev/null)" "$1"; }
@@ -185,7 +187,9 @@ fetch_video() {  # fetch_video <link> <id>
   # A playlist link downloads the playlist into a folder named after it; a video link that
   # happens to come from a playlist (watch?v=…&list=…) downloads just that video.
   # Before each video, its picture is fetched in the background for the menus (see thumb).
-  yt-dlp --newline --no-playlist --no-mtime -P "$DEST" -o '%(playlist_title|.).80B/%(title).80B.%(ext)s' \
+  # -v puts yt-dlp's versions and every step it takes in the log, for the debug report
+  # (see report); the list leaves its "[debug]" lines out.
+  yt-dlp -v --newline --no-playlist --no-mtime -P "$DEST" -o '%(playlist_title|.).80B/%(title).80B.%(ext)s' \
     -f 'bv*[vcodec^=avc1]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b' --merge-output-format mp4 $js \
     --exec 'before_dl:echo NAME: %(title)q' --exec 'after_move:echo FILE: %(filepath)q' \
     --exec "before_dl:sh '$0' --thumb $2 %(thumbnail)q >/dev/null 2>&1 &" \
@@ -220,6 +224,9 @@ work() {  # work <id>: the background worker, for as long as the download takes
   fi
   echo "=== exit $code"
   announce "$1"
+  # A failure leaves a debug report in Files, ready to send to whoever helps.
+  load "$1"
+  [ "$state" = failed ] && save_report "$1"
   update_if_due
   rest_unless_busy "$1"
 }
@@ -360,7 +367,8 @@ deliver() {  # deliver <id>: move the finished download into $SHARE, if that's m
 place() {
   to=$2
   if [ -e "$to" ]; then
-    if [ "$(stat -c %s "$1")" = "$(stat -c %s "$to" 2>/dev/null)" ]; then
+    size=$(stat -c %s "$1" 2>/dev/null)
+    if [ -n "$size" ] && [ "$size" = "$(stat -c %s "$to" 2>/dev/null)" ]; then
       rm -f "$1"
       printf '%s\n' "$to"
       return
@@ -424,7 +432,7 @@ load() {
   # What yt-dlp is doing before the download starts, from lines like
   # "[youtube] FOv2CAItUBs: Downloading player 1a2b3c4d": "Downloading player 1a2b3c4d".
   # "[youtube] [jsc:quickjs] Solving JS challenges" becomes "Solving JS challenges".
-  step=$(printf '%s\n' "$seg" | grep -E '^\[[A-Za-z:_]+\] ' | grep -v -E '^\[(Exec|download)\]' |
+  step=$(printf '%s\n' "$seg" | grep -E '^\[[A-Za-z:_]+\] ' | grep -v -E '^\[(Exec|download|debug)\]' |
     tail -n 1 | sed 's/^\(\[[^]]*\] \)*//; s/^[^ :]*: //' | cut -c1-48)
   case $seg in *'=== moving to Files'*) step='moving to Files' pct= ;; esac
   [ "$state" = running ] && [ -z "$pct" ] && preparing
@@ -799,7 +807,7 @@ render() {
       n = split("⬅️ back 📥 downloads ⬇️ downloads ➕ add 📂 folder 📦 folder ⚙️ settings 🆕 new " \
         "🔔 bell 🔕 belloff ⬆️ update 🔧 tools 📲 app ⏸ pause ▶️ play ⏹ stop 🔁 retry " \
         "🔄 refresh 🗑 trash ℹ️ info ✅ done ⚠️ failed 🧹 clear 🖼 pictures ⏳ prep0 " \
-        "1️⃣ appstore 2️⃣ copy 3️⃣ paste 📊 live 📤 share 🔗 copy ➖ remove", w, " ")
+        "1️⃣ appstore 2️⃣ copy 3️⃣ paste 📊 live 📤 share 🔗 copy ➖ remove 🐞 bug", w, " ")
       for (i = 1; i < n; i += 2) pic[w[i]] = w[i + 1]
       printf "" > menu
     }
@@ -886,6 +894,8 @@ tapped() {  # tapped <key>: act on the row tapped. Fails after printing an answe
     share) load "$id"; echo "@@share:$link"; return 1 ;;
     delete) screen="confirm $id" ;;
     delete-yes) notice "$(delete_download "$id")"; screen=list ;;
+    report) report_answer || return 1 ;;
+    report:*) report_answer "${1#report:}" || return 1 ;;
     notifications) screen=notifications ;;
     update-app)
       if [ -s "$SHORTCUTS/.pending" ]; then
@@ -1073,7 +1083,9 @@ item_screen() {  # item_screen <id>
       web_ok && row "live:$1" 📊 "Watch live" "A progress bar that moves as it downloads"
       stop_row ;;
     paused) row resume ▶️ Resume "From where it stopped"; stop_row ;;
-    failed) row resume 🔁 "Try again" "From where it stopped" ;;
+    failed)
+      row resume 🔁 "Try again" "From where it stopped"
+      report_row "report:$1" "What went wrong" ;;
     done)
       if web_ok; then
         row open ▶️ Open "Plays it right here"
@@ -1145,6 +1157,7 @@ settings_screen() {
   if [ -n "$SHORTCUT" ]; then
     row pictures 🖼 "Pictures in menus" "$(on_off_flag "$JOBS/.plain")"
   fi
+  report_row report "Everything aria2 knows"
   row ish 📲 "Open iSH-AOK" "The terminal behind aria2"
 }
 
@@ -1276,6 +1289,96 @@ delete_download() {  # delete_download <id>: prints what it did, as a title line
     echo "Couldn't delete $name"
     echo "Delete it in the Files app instead"
   fi
+}
+
+# ---- Debug reports: what to send whoever helps when something goes wrong ----
+
+# report [<id>]: the phone's setup, the tools, the settings, the list, the whole log of the
+# download (or of the latest failed one) and what the updates and the live view said. It
+# leaves out the Bark key and the live view's token. Quick enough for a Run Command.
+report() {
+  rid=$1  # not id: status below uses that
+  if [ -z "$rid" ]; then  # the latest failed download, else the latest one
+    for i in $(ids); do
+      load "$i"
+      [ "$state" = failed ] && { rid=$i; break; }
+    done
+    [ -n "$rid" ] || rid=$(ids | head -n 1)
+  fi
+  echo "aria2 debug report · $(date)"
+  echo "dl $(sha256sum <"$0" | cut -c1-8) · shortcut $(cat "$SHORTCUTS/.version" 2>/dev/null || echo '?')${SHORTCUT:+ (this one: $SHORTCUT)} · Alpine $(cat /etc/alpine-release 2>/dev/null || echo '?') · $(uname -m)"
+  echo "yt-dlp $(cat "$JOBS/.yt-dlp-version" 2>/dev/null || echo '?') at $(command -v yt-dlp) · $(aria2c --version 2>/dev/null | head -n 1)"
+  tools=
+  for tool in ffmpeg node qjs python3 curl; do
+    if command -v $tool >/dev/null; then tools="$tools $tool"; else tools="$tools (no $tool)"; fi
+  done
+  echo "Tools:$tools"
+  echo "Free space: $(df -h "$DEST" 2>/dev/null | awk 'NR == 2 { print $4 }') · Files folder: $(share_ready && share_host || echo 'none mounted')"
+  awake=no
+  pgrep -f 'dd if=/dev/location' >/dev/null && awake=yes
+  echo "Keeping iSH-AOK awake: $awake · /dev/location: $([ -e /dev/location ] && echo yes || echo no)"
+  echo "Settings: notifications $(on_off "$JOBS/.bark") · automatic updates $(auto_updates && echo on || echo off) · pictures $(on_off_flag "$JOBS/.plain")"
+  echo
+  echo "== The list"
+  status
+  if [ -n "$rid" ] && [ -f "$JOBS/$rid.log" ]; then
+    load "$rid"
+    worker=no
+    running "$rid" && worker=yes
+    echo
+    echo "== Download #$rid: $state${reason:+ ($reason)} · worker running: $worker"
+    # Progress lines and aria2's summaries repeat every second or so: keep the last one.
+    awk '/^\[#/ { last = $0; next }
+      /^\*\*\* Download Progress Summary/ || /^-+$/ || /^ *$/ { next }
+      $0 == previous { next }
+      { if (last != "") { print last; last = "" } print; previous = $0 }
+      END { if (last != "") print last }' "$JOBS/$rid.log" | tail -n 300
+  fi
+  for log in .update.log .app-update.log .web.log; do
+    [ -s "$JOBS/$log" ] || continue
+    echo
+    echo "== $log"
+    tail -n 25 "$JOBS/$log"
+  done
+}
+
+save_report() {  # save_report [<id>]: into .logs/report.txt, and into Files as aria2-debug.txt
+  new_report "$1"
+  report_to_files
+}
+
+new_report() {  # downloads that fail at once mustn't write into the same file
+  report "$1" >"$JOBS/report.txt.$$" 2>&1
+  mv -f "$JOBS/report.txt.$$" "$JOBS/report.txt"
+}
+
+report_to_files() {  # under another name first: writing into a file Files has open can hang
+  share_ready || return 0
+  timeout 30 cp "$JOBS/report.txt" "$SHARE/.aria2-debug.txt.new" &&
+    timeout 30 mv -f "$SHARE/.aria2-debug.txt.new" "$SHARE/aria2-debug.txt"
+}
+
+report_row() {  # report_row <key> <what it covers>
+  if [ "$LEVEL" -ge 3 ]; then
+    row "$1" 🐞 "Copy a debug report" "$2, to paste for help"
+  else
+    row "$1" 🐞 "Save a debug report" "$2: aria2-debug.txt, in Downloads"
+  fi
+}
+
+# report_answer [<id>]: a fresh report, copied (level 3) and saved in Files. Fails after an
+# answer for the Shortcut.
+report_answer() {
+  new_report "$1"
+  report_to_files >/dev/null 2>&1 </dev/null &  # Files may be slow; the copy isn't
+  if [ "$LEVEL" -ge 3 ]; then
+    notice "Copied a debug report" "Paste it into a message to whoever helps you"
+    printf '@@copy:'
+    cat "$JOBS/report.txt"
+    return 1
+  fi
+  notice "Saved a debug report" "aria2-debug.txt, in your Downloads folder"
+  return 0
 }
 
 # ---- The live view: web.py, a small web server, shown in the shortcut's Safari sheet ----
@@ -1425,6 +1528,7 @@ case $1 in
   --act) web_act "$2" "$3" ;;      # the live view's buttons (web.py)
   --awake) keep_awake ;;           # while the live view is open
   --rest) rest_unless_busy ;;      # when it closes
+  --report) report "$2" ;;         # a debug report (see report)
   --update)
     keep_awake
     case $2 in tools | app) update_now "$2" ;; *) update_now tools; update_now app ;; esac
@@ -1438,7 +1542,7 @@ case $1 in
   -p | -x) pause_all ;;
   -r) resume_all ;;
   -c) clear_finished ;;
-  '' | -h | --help) sed -n '2,16p' "$0" ;;
+  '' | -h | --help) sed -n '2,17p' "$0" ;;
   *) add_links "$*" ;;
 esac
 DL_SCRIPT
@@ -1480,6 +1584,7 @@ playlist iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAADDklEQVR42u1dMVLDMBD0Q/Q
 live iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAADFUlEQVR42u2dPW7cMBBGdRAdYkvdICdgmzuoyC1yi3SsUgbp0qwBAykCV4sUAYQgSJE0LoJ0jGlQiGxrdyWtljMjPgIEDMven++RwyGHHFaV4rJ7f+NS9YMaztTh3z7+f0WZJXgUrpsg9Nza9VBQ+r/g9UNtH+r+CoKfq/v03nWJwjcTzUmuGj9LU4Lw7ZXMy5pmqkV4QKxqaiwJPwaisSh8rczGrzFG1FbEd8Zb/ane4LSL7zco/IveoNXkdAWIP+wNNSandJOUxA+FV4f4pUFAfEEIiC8IAfEFIRToaupyURF/HgRmuFuZMWP3BccD7L7weIDpETRFKZiCgOvUBq/HkleUYrgIt25taf0WeoGF1v/601348vs+9CX+HH+3iV6gvfW/+vA5HCvxmeleYMHz+fj911EA8Zlpj8iC3//zz9+jAOIzs/OCNOtV/wXOFSMDcm3W9dwIgHYMwB4A+bbGjwEIAMhXzS45bwXAk6VqS6ueGwLgTS49bAhAZ87+bwxAMBlyvBRAXK549/XH46z57d036eULVxSAN7eH0dmzIARnLuy4FMCpRTzBJQxfDICx1j8sQsvZAOhLfC4FIABADEAAAAAAICZm/NJ9bDd6ItEvB0BG8ZeEFQGQwZSccgkBcMXWP0UMAABgdQAeALITMQAAoGwADgBiABwApAFIhCQB8GxrSu6gPABeBuU9AA75B2CpjVkAGDlDDICDjP2X2JwLgPHNuS0AZLen1wAQPKCR0xu6RIylR5QUAfAqDuktDcgsPaQXX1PJntJGxTHVuD9zSUjykmOqx+DFz6LmsHbOwTgG4ZcIcclB7efgp2wEyJ6ugFQFwgk7SNYhnKyDXqAgiR8Jm4QTNpGyTEH2RJL2CSftI22lcNpKTJGQ6cErEvB6GA8U2X3GAwV2HwgKxQeCAvGBoEB8ICgQn4vcFN0tueMqQy7zNDvDxSQZNDlc6GznZm2uNFcCojUGopsdwwUEws81TV6ZjW+q0koarNudTN7qfXrvuqI8cWH9lcxUl17bofQ8ID0UP9FsDf/WaRf8H44SRP374cRfAAAAAElFTkSuQmCC
 share iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAADJElEQVR42u2dzXGDMBCFObsGrumBY5rglCp0SQVpIGkgd824gRTAuIIUgCtIBcSbwFi2ZUBGsLvS08xePBiY96HV6m9VFILL7q2re7OOdRPmXvv3/wIlSHASrp0hdKi1AxQofRa8PJk5WbOC4FPW9M8ucxS+mulOtjJ6lyoH4c1K7iWmmzIQHiCiuhpNwvtAVBqFL4X5+BhtRKlF/Fr5Vz9WG2rp4tsEhb+pDVJdTpuB+G5tKOFycndJvfhd5lZD/NwgQHxGCBCfEQLEZ4SQYagpK0SF+GEQ0MNNpccMv8/YHsDvM7cHcD2MrqifTIGAcaxC1KMpKurncCFcXDPJff37739LqhZo+fpJ+KEogmCS+Ppd8ZVBaNVHPj7xlUGo1Mb9Y+IrgmDHer2qxVcEoVTV+IaIrwSC8QFoUhFfAYTGByAp8aVDED/k/LI/d7SubUxsn9G9RA9Vaxv1vFfUjpJqG3hLBEAr2v9nAKBTO+WYCoC/dgAA+AFYAGBsiLkBPL133cfhfgg52PPnfAB07dT96Jn07KwBUHw+t7ix/BSAR+/LBYDtBY4//ADoHVgjIQ1f/5oAuGsBAADApTuY0zA+GgXRvX1uDwACRy6XhKG+wTwAAAAAAICMAVgAyLAnDAAAIAZADQAZzgcsAXA43v6XflMJgGtKcgkAGm6+Lu5wtRYArJPySwC48wih4/qCALSsy1KWAoi52IsJgGVdmAUAV3uIAYBxaSLH4tzMATTsy9MzB2DYN2j4AMyN5ZeYrw/BAKBk36J0b9qQBJpaUvKo+cRnAGBFbNILnbdds2wMoBKzTVVKEbVZe8vGmHqx3IXeQVy6gi1rwetX2AKtWIWeSc8WmbADyTqYk3UgXY2AJH5I2MScsAkpywRkT0TSPuakfUhbGXnIGdkTlbgeREUMUQ/aA0F+H+2BAL8PCALFBwQB4gOCAPEBQYD4OMhN0NmSOxxliMM81fZw4ZIUuhwc6KznZG0caS4EhFEGog2ewwUICB/qmqwwH18VuZW+sTY7nrzVTf/sskC5CGHtSm6q7e9dQ+kwIAMUO9NtudfW0gX/BbMdgVv1FFroAAAAAElFTkSuQmCC
 remove iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAACcUlEQVR42u2dTW6DMBCFOYgPwkV8EC7CprtsuoxE78Edou6Qou7TA9C4clSqRgmo4DfGn6XZkWC9h9/M+GdcVYZb2774aN3Exic2ffb79xVtEeABuGEG0EttuJEC0j+Au6s1V+s3APyZ9fHdrkTg65lykspCX+oSgG82kpc1ZaoBeIhYVWpyAv4eEXWOwDtjGr+Gj3C5gO8z/+ofjQZvHfxuh8D/GQ1WJWcoAPzpaHBITumSFMEfCzcP+KWRAPhCEgBfSALgC0koMNS0FaIC/jISyHD3kjGj+0J/gO6L/QHSI5SiuJgCgOtYTdSTU1QU13ABbl1r+PpzGAV8/eJRwNcvHAVEPuKIiLhfmBfErBeA0pjD+VpzxqIt4qVaf48AgEloTDlbmqom+hFHQyRf4qQMMIR+AP0X+wEI0BOAA1Y6YgiAgOIJSPrSw+F1PJ3ex8vlc7TSQl9Cn0LfkkdCKV92PL6N1lvo424JOJ8/zBMQ+rhbAnJpEAABSBBOGCdMGJqKABIxMmEIAAwhAUxHsx5Q+MI8QIi3prAor1+UxxGLt6XgB9RniAFEuDWRzbk2NueyPV28PZ0DGsoDGkRDBkoXcEjPQNkCkjLxYW2csYFyBYwCccEORoG4WAejQFyuhogoceRD6QJR3E/Rvu2lp/1vEVemqleccqZ6YibSQ1QkiHrwB4Z0H39gQPchwSD4kGAAfEgwAD4kGACfi9wM3S3ZcpUhl3lmm+EiSRlKDhc653OzNleaGyGiyYyIYfEaLkQA/FJp6oxpfF2V1qKzbkRb4/v4blfRfoWw3UYyNcT/9iC9jJAbKd1M2Zo+660D/gXJFS+bv20XhgAAAABJRU5ErkJggg==
+bug iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAAEbklEQVR42u1dvY7UMBDeB8ljXJFnoE9BSU2ViopXQDwDonJPRb9XUSAqaJBSIIqrqOiWm1Oi9YacPbaT8TfJWLLEHVkn9332N39e53QCbnf3L7uxO69fIt2/9unzJ2tJgBNwAwPo1D5MpBjSV8Cbx94/9vMGgMf6ebx3c0TgW6acSHV6lvYIwPcbycuaMtUb8EbEqlKjCfglIlqNwDdgGr+GjWi0gN8pn/Wh1dChg+92CPx/qwFVcoYDgO+vhsYk5+iSNIJ/OXjvDPyjkWDgVyTBwK9IgoFfkYQDuppYLqqBn0aCRbh7iZhN9yvaA9P9yvaglvS8+f7+8vnh/vLq29visWgMGovGVCVFYzFF/IEJML+VkLDmWIW9VeP1zEH7/ffh8uLL6+Rx6DP0WRAChlTw+5ra+fHXpyISlsCnMSvbg16Vz0+67Tf6WeKz1VdB7dnv969/fiQDOQefxgDyinpVEe+SlLz7+eHGXvi6Tv+3hv2otgpqeT6pJMxXxtLvAMGPe0SoKQfy4VNbRb8/Ly4Yo17YqHK+CkKNrgWPkBto4xtzSzkNwO1MM8aVtoizbEBuA7UBT1vjlwiAfNi5Z5PSfI8JratJOc/9+pQGEoDFU9XIBZcdE+BUlBt3TMAAr/+5MYCCWOBqB9BLjjv1gq52QEPNd4dxwA0BTmIWkx4TKLlFkaX8z3MtNwNKz0bPSM8qtHqcCAFLybRUH31eKQu1VJLpWZaSebshIJSzoRkXmm3T6snxgGLj0r1DOSYpAiCiWZqB85m7lIqeG9mQkV5KSdM9OHImFUWfJL2Z2IybQKM/noAKXev7+KEVQmPQWDQm596xFamWgJjmlgRZJcFark1STcDc66hFQIlXtgsCfHniSMQaBEwShxKkwaUhuO5mDgG1Z7sKAri5nxwCEHNDRgAAAVC1AC6YOQQApqedGAGkvzQDY53rnuYQQGNznkHQVsgQUOqnbx0HVFwtTiQdvUXbmgChXJBMPSDFv0chQCgb2omUJKc8EAEV61yycgigsTnPIJUPgizKH8gLGiC3pXA3YuUQALZRy0FuzDpQINZBbk3k7oLIIQBplwTc5lxuwabUCEsXXFI25/a1sp+5Nd8SN3StL4KvuT29kTa2JfHBWnHAVB+o/gUNCW+IWwGjnE3suhQCaCxOjkmoQubEv6TH3Ykwl4WQR8QlwPd8uHK3tEND7NiCLYKykNTESoTPkcAh4Dm3k1MC3SgVMVT5onYoNZyytZFLQMrWwlAKvNpxBWuvAn8Wl7iBk6tKgPkzlP492Y3SsTcM2gY1h3XstPd2SJ+mQ/wQjy1Q3Fs7LVHj6Yl2aB/AIa52bCXAMcYmRRUPbjWvCODoYrMHwrpv9gBA940EQPCNBADwjQQA8I0EAPDtRW5A75a8s1cZ2ss81Ua4JkkKJcde6Kznzdr2SnMQInplRAzJNVwjwoBPlSYHpvHt6WhtNNZ9pa3x5/HezcnajQvrNpKpYRy7M6TTCJlIcUzZ8q/t0AH/B5af1rMA+0zeAAAAAElFTkSuQmCC
 ring0 iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAAEeUlEQVR42u1dzW7UQAzeM8+QGy+RF8mD5B14AB6CU86cOebGoVJVbaWiihRUVKEilUOLkAj1KoFlye7YM/aMveuVLKGy2STf5/ns+fOsVoo/Dw+PzWTdlo0B2/7u5vqVf0iAA3ADAmiqDTMpjvRfwKtna5+tFwA8ZP107+oUga+RcpLL4FnqUwC+FZIXTplqHXgnglVqLAG/RERtEfhKSuPv7r6Nt7dfFw3+TzBGVFbAbzi8fgb66urjuF5/GM/OLkgG18C1jMQM6lPYVK+fAaeCjbWZkNTWoFVyhlhPv77+JAb6PoN7JrSMQY0kxUoOvHyMtHAbPEMkEeUlaQLfJPCMRDQmwL+//64S+CUi4FlVk0AF/+bmi3rgdw2eWSUJFPCteD1ja2jUgA/p3vn5pVnwZ4N3IKauTfFUEx7YOvC7RiBBJkXFgi+l99CJmjtSh2z+XuG4MBTp4XK+OOgvvHDKMAJcC7/BGYfgHbP2mLG6z+X50EONSANRCQFXj5vQEposup+q+RDoItK+aIN7pSYIyJiQFg8w0pMKvpTH52gRSBK6WPBrzEvEehJcJzh+T4oTKe+AdJ5aJOuJDW4QyEp4/SFHik0gAAP2rGiawxUJutDstU5BxkoSMn61bN4PHiPcmSlmsTEN0aIHNu+PkR4L4KeQgJSiNtn7IWgdk+xwyhEiqRiSMx+q9xN6juqMGpiRraCOzvup3k9I06Ls3eXTxiSzI2qKimgF3aFeL6v3S+X568+P48vXv8YXr8aNwb/hb1L9BIFWUJGDL/VBJHW/ffvzD/izwd+0xAOE47VLBPRcDyEtPbvgz6ZFihDO1y8RcPAi4flU1QTEdDxDv0cacqbmxdLZSQkCqE6I6Pc06OyHko7lyPlLEUCRYUT63aE7X8xdcrMEUIdg0J0yruwHmYKZJYCaioeyIXb9zzWrVZIASjBGxYEQART9zzXBUpIAiiIg4kATDMCUJpdrjKYkAZSYiJDkLkiAxkG30gRQVMEJMEAAi97lnHApTQAlMQlmQlw3cgLicHECnAAnwAlwApwAJ0AjAZ6G5klD1XbEYMXDm/c//rN9BCx9V2LVxMn0hHdXP1BNarVEVgJKD8bFkiC5VIV7ME79cDSVBC3rhLDD0SYmZLAkSIIvMiFjaUoyRII0+CJTktYm5feRkAN8yUl5U8tScq4NzbUsxdTCrG0ScoEvujDL2tLEbRJygS+6NNHa4twSuyhzLM41szxd+3al2OXpZjZo5N7InWWDhsUtStqkJ2mLkm/SU7BJz7epFt6m6hu1FWzU9lIFhUsVeLEOBcU6vFxN4XI1XrBJQcEmL1lWuGSZF+1TULTPy1YWLlvphVsVFG710sUKShd78W4Fxbu9fL3BMwT8AAc/wuT4jjDxQ3wMn6Tkx1j5QW7HdZCbH2Xoh3n6YZ5+nK0f6OwHOgcmdfxIcwVEtMaIGMhzuE6EA0+Vpk4R8N1RSE1ksG5DS+OFrJ/uXa38808K2wnJ1DD9duNI0wiZSemQsrX93UY74L8B6eii+J9r78gAAAAASUVORK5CYII=
 prep0 iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAAEU0lEQVR42u1dzWoUQRDes88wRx9iTr7FHHyMwQfyGubm1aPC3gMhRFhZ7AgJQSIkoijKmFpmMG7mp6q7ert69lsojLs9f19Vf1U13V29Whn+3N39qDppHkk7I4/b7o5f4SMCnIBzDKCl4nqlAOl/gBcPUj/IOgLgc7Lurl0cI/Alk04OJXQv5TEAX0eiF02aqgE8FKFKNTkBP6SIMkfgi1gcf3Pztb26+jIo9FtEH1HkAn6lYfU90JvNp/bi4mN7enouEjqGjlVUjDMfwoZafQ+4FGyu9AoJ7Q1WKcf5Wvp2+zka6GNC1wzoGc4MJflSDj28D7VoC92DpyLSU1IHfpbAKyqiygL829t7k8APKYLu1bQSpOBfXl6bB35f6J5NKkECfi5Wr9gbKjPgU7h3dvYhW/B7oWcQhq5V8lCTbjh34PdFoIQ4ISoX/Fh8T0lUn0hNSd8usV9wSTJczQcn/qUHDnmNQMfSOTT9ED3jQTNmLu9rWT5lqB5hICsg0Mq4BT2hOgjvh3I+OTqPsM9b6FqhAQLTJ4T5Aw71hIIfy+IP0SOYSmh8wS85D+FrSXRcxPf3Ij8R8gxM4ymjRD2+zo0cWQqrnzIk3wCCMFCPirox3ChOl7q91SFIX0pi+q9azfrJYiInM8nE16cxerRTs34f6skB/BAlMKmoDrZ+clpLoh1NOmIEFS448pFavyBzNCdSx8zsBaV33C+1fkGYZlJ8wmxGL2imsl5V67cQ52vkCRF6QSF2vtIbyZH3tfwBw/DqIQWstW4id+oJpSKG8a2HFDB5UOTxVPMiTTznzid65SyNi5cGvo8RMvKeih39SMKxJXF/CA0zwu+GnXwpp+RZ+wJFJnAs/pdEP8wQLGuRhOJz0ZA6/y/R+YY4Y5YfmFOAhP+XkHhpJmYMP1DNOmBJl1s6+FKfyKDkZlYBx/DSLeZLOiggAwWo8F3ogMu37bv219uX7e83L3b/0v/H2t5fb9qf71/t2pLQ3/Sdxrm1B2xmIyGtC4Uo4Pv5Sdu+fvZE6Psh8P+cPH/Slr4bUoLk3DEUMIdLcgUQaEMA9bLfnqx9rC39tt9+6txTveZoFDBmoWOWSjQy1pZ+Czk3FAAFgIKOTgFwwghDk4ehSMSQCUMBeBmX8GUcXkcnfh2NAZmUAzIYkkw8JIlBeRuD8piWknhaCiZmpZyYhamJiacmYnKujcm5mJ6eeHo6FmikXKCBJUqJlyhhkZ6BRXpYppp4mSoWahtYqI1SBYlLFaBYh4FiHShXk7hcDQo2GSjYhJJliUuWoWifgaJ9KFuZuGwlCrcaKNyK0sUGShejeLeB4t0oX5/hHgLYwAFbmCxvCxNs4pPxTkrYxgobuS1rIzdsZYjNPLGZJ7azxYbO2NB5ZlAHW5obUESdmSKceAwXigDwUmpqDAHfLIJqPJ11PTc1PpKsu2sXK3z+C2GbSDTlunNXQFqmkF4pDZO2HretrAP+F1XXCF/AXGcuAAAAAElFTkSuQmCC
 ring10 iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAAFcUlEQVR42u1dzWoUQRDes8+wB8F3kPXgG3gdvPsGc/OuJxHxInjQm4jMwZMgehC8LF4EA0ESiQYnSkIIURNEE3/G1LKDk2F2p6q7qrp6twMFIrs7Pd/X/VVV/1QPBob/Dg5+ZFMrGlb1WPOzk+8P0h8JcACuRABNtbImJSH9H/DhieUnNhYAvM/G02cPlxH4EVJOtAzaMloG4HMheeGUqTwBn4hglZqYgO8iYhQj8EMpjd/d/VJtb+9Vbz58rR68PjplL9Z/SvqIYSzgZxy9vgZ6Y+Njtbb2vlpZeTux56/eVZfuf6vOXK/m2sV7f6rLj35zElOaD2F9e30NeA122wD8szePe8GfZTUhvqPBquSUrj19c/PTTNCbduXhnjP4bcuf/PIZGaUZSXKVHAC+KS0Y4wK/LVWORISXpCn44sCD3Xq6JUIAAxFZFODv7x86Aa9FQJOItc/GSaCCv7W14wy8tATNshsvj22SQAHft9dLOmGh0ZCZAR9CytXVdTbwOcJQF7tw92jyLsFJoISa0GBO4NskaI+Eq493KCTIhKhY8Ln0vm2QoIEBELW1pyLAINkC4yQAMm9oA7wbloQgGe68LJZq4DvghSFsdc1aIawEZwpa7ktCsyOoZsxY3efq+ZAVg/PmnlADZwrZrwv45+98P9VGwkjIVHTfV/PBWRNeyttgVJy7/RdNAPicdpuRPsHPH2Ckxxd8qR7PNSIg6gLH39V2JAmFK/gjTJzvGmrC93z0ncvAT8waDQA+ZODz3gHZeUYiUY9rkgWOLESvn9eRrj07nGh9DTzIzqye3w4W2KOi6RquiNMFybG6BImdFm8b0n/lbL0feoxLQ4kZZRBz9WmIEV2y9X4X6YkBfB8SkFKUe/d+cJyLJDuccoQIKkrvyIfa+wmZozmjZvbIUTByjvupvZ8QpjmHkIJbUZzCbMQoKOZlvay9XyrOhySqGbvDvx1WsdBLqAKjYEh2vtSGSOp+VwYL/2fFHyA6Xt5FwJirEdLSM2vawIoUITrfuIuAuV8SSEyiIcAl8ez7PdKUMzUulo5OQhBA7YSIvCdDRz+UcEwj5g9FAEWGEeF3gU6+mFPyaAmgTsGgkzKu6AcZgkVLADUU74uG2PVfa1UrJAEUZ4zyA30EUPRfa4ElJAEURUD4gazXAVOGnNYcTUgCKD4RIclFLwEWJ91CE0BRhURABASw6J3mgktoAiiBSW8kxPWgRIAbLomAREAiIBGQCEgEJAIsEpDCUJ0w1GwiBjseuk7BzCKg67MSuyaWJhNu736gmtRuCVUCQk/GuZIguVWFezLO/HQ0lQQr+4Sw09FRLMhgSZAEX2RBJqYlyT4SpMEXWZKMbVF+Fgka4Esuyke1LUVzb6jWtpSoNmY1SdACX3RjVmxbE5skaIEvujUxts25IU5RamzOjWZ7uvXjSq7b06M5oKFpagc0YjyiZE16vI4opUN6Bg7ppWOqgY+ppoPaBg5qp1IFgUsVpGIdBop1LGO5Gtd6dyLlapapYBO0wecdxAo2LXrJMnimq+SolCxb5KJ98Czfqr4qRfsWqWwlR49XL1sZe+FW+C78BmcBcfXCrZZLF3dZ/TmJNgQrXWypeHcoC16820L5+hAG72CifL2FCxy0DdpODAjs3aIh6RckzSEstn2PTCyjwaHXx3OTks81VhrAO4a8Ju4SK2MlwgN4O3dLal1lyGnwTI8kz85VhpqXeXIkcwyLQvYu89S8zpYiLTXgTNPe9q+z1bzQucsE1xfiudC5Y1EnXWlugIg8MiJK8hpuIiIBT5WmwhDwxUJIjaOzzvu2xgvZePrs4SD9nQphCyGZKqe/nSWkaYTUpBRI2Wp+NrMO+D8ytXyaUI+pvQAAAABJRU5ErkJggg==
@@ -1641,7 +1746,7 @@ def job(i):
         name = os.path.splitext(name)[0]
     m = last(r"=== size (.*)", lines)
     size = m.group(1) if m else ""
-    steps = [line for line in lines if re.match(r"\[[A-Za-z:_]+\] ", line) and not re.match(r"\[(Exec|download)\]", line)]
+    steps = [line for line in lines if re.match(r"\[[A-Za-z:_]+\] ", line) and not re.match(r"\[(Exec|download|debug)\]", line)]
     step = re.sub(r"^(\[[^]]*\] )*", "", steps[-1]) if steps else ""
     step = re.sub(r"^[^ :]*: ", "", step)[:48]
     moving = "=== moving to Files" in seg
@@ -1740,10 +1845,13 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, PAGE.replace("{{TOKEN}}", TOKEN))
         if url.path == "/status":
             return self.send(200, json.dumps({"jobs": jobs()}), "application/json")
-        m = re.fullmatch(r"/(thumb|play|file)/(\d+)", url.path)
+        m = re.fullmatch(r"/(thumb|play|file|report)/(\d+)", url.path)
         if not m:
             return self.send(404, "Not found", "text/plain")
         what, i = m.group(1), int(m.group(2))
+        if what == "report":  # dl's debug report, with a button that copies it
+            text = subprocess.run(["sh", DL, "--report", str(i)], capture_output=True, text=True, timeout=60).stdout
+            return self.send(200, REPORT.format(token=TOKEN, text=html.escape(text)))
         if what == "thumb":
             data = read(os.path.join(JOBS, f"{i}.thumb")).strip()
             return self.send(200, base64.b64decode(data), "image/jpeg") if data else self.send(404, "", "text/plain")
@@ -1825,6 +1933,20 @@ def watch(server):
         time.sleep(15)
     server.shutdown()
 
+
+REPORT = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark"><title>Debug report</title>
+<style>
+body {{ margin: 0; padding: 12px 16px 32px; font: 15px -apple-system, system-ui, sans-serif; }}
+p {{ color: #8e8e93; margin: 4px 0 12px; }}
+button {{ font: inherit; font-weight: 600; border: none; border-radius: 12px; padding: 11px 16px; background: #0a84ff; color: #fff; }}
+pre {{ font: 11px ui-monospace, Menlo, monospace; white-space: pre-wrap; word-break: break-all; }}
+</style></head><body>
+<p>What aria2 knows about this download. Copy it, then paste it into a message to whoever helps you.</p>
+<button onclick="navigator.clipboard.writeText(document.querySelector('pre').textContent)
+  .then(() => this.textContent = 'Copied', () => alert('Select the text and copy it instead.'))">Copy the report</button>
+<pre>{text}</pre></body></html>"""
 
 PLAYER = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -1959,6 +2081,8 @@ function render(j) {
     if (j.state === "running") button(c.actions, "Pause", () => post("/act", { id: j.id, do: "pause" }));
     if (j.state === "paused") button(c.actions, "Resume", () => post("/act", { id: j.id, do: "resume" }));
     if (j.state === "failed") button(c.actions, "Try again", () => post("/act", { id: j.id, do: "resume" }));
+    if (j.state === "failed") { const a = el("a", "button", c.actions); a.textContent = "Debug report";
+      a.href = `/report/${j.id}?t=${token}`; }
     if (j.state === "done" && j.path) { const a = el("a", "button", c.actions); a.textContent = j.playlist ? "Videos" : "Open";
       a.href = `/play/${j.id}?t=${token}`; }
     if (j.state === "done" && j.folder) { const a = el("a", "button", c.actions); a.textContent = "Show in Files"; a.href = j.folder; }

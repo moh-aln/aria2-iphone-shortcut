@@ -133,7 +133,7 @@ def job(i):
         name = os.path.splitext(name)[0]
     m = last(r"=== size (.*)", lines)
     size = m.group(1) if m else ""
-    steps = [line for line in lines if re.match(r"\[[A-Za-z:_]+\] ", line) and not re.match(r"\[(Exec|download)\]", line)]
+    steps = [line for line in lines if re.match(r"\[[A-Za-z:_]+\] ", line) and not re.match(r"\[(Exec|download|debug)\]", line)]
     step = re.sub(r"^(\[[^]]*\] )*", "", steps[-1]) if steps else ""
     step = re.sub(r"^[^ :]*: ", "", step)[:48]
     moving = "=== moving to Files" in seg
@@ -232,10 +232,13 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, PAGE.replace("{{TOKEN}}", TOKEN))
         if url.path == "/status":
             return self.send(200, json.dumps({"jobs": jobs()}), "application/json")
-        m = re.fullmatch(r"/(thumb|play|file)/(\d+)", url.path)
+        m = re.fullmatch(r"/(thumb|play|file|report)/(\d+)", url.path)
         if not m:
             return self.send(404, "Not found", "text/plain")
         what, i = m.group(1), int(m.group(2))
+        if what == "report":  # dl's debug report, with a button that copies it
+            text = subprocess.run(["sh", DL, "--report", str(i)], capture_output=True, text=True, timeout=60).stdout
+            return self.send(200, REPORT.format(token=TOKEN, text=html.escape(text)))
         if what == "thumb":
             data = read(os.path.join(JOBS, f"{i}.thumb")).strip()
             return self.send(200, base64.b64decode(data), "image/jpeg") if data else self.send(404, "", "text/plain")
@@ -317,6 +320,20 @@ def watch(server):
         time.sleep(15)
     server.shutdown()
 
+
+REPORT = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark"><title>Debug report</title>
+<style>
+body {{ margin: 0; padding: 12px 16px 32px; font: 15px -apple-system, system-ui, sans-serif; }}
+p {{ color: #8e8e93; margin: 4px 0 12px; }}
+button {{ font: inherit; font-weight: 600; border: none; border-radius: 12px; padding: 11px 16px; background: #0a84ff; color: #fff; }}
+pre {{ font: 11px ui-monospace, Menlo, monospace; white-space: pre-wrap; word-break: break-all; }}
+</style></head><body>
+<p>What aria2 knows about this download. Copy it, then paste it into a message to whoever helps you.</p>
+<button onclick="navigator.clipboard.writeText(document.querySelector('pre').textContent)
+  .then(() => this.textContent = 'Copied', () => alert('Select the text and copy it instead.'))">Copy the report</button>
+<pre>{text}</pre></body></html>"""
 
 PLAYER = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -451,6 +468,8 @@ function render(j) {
     if (j.state === "running") button(c.actions, "Pause", () => post("/act", { id: j.id, do: "pause" }));
     if (j.state === "paused") button(c.actions, "Resume", () => post("/act", { id: j.id, do: "resume" }));
     if (j.state === "failed") button(c.actions, "Try again", () => post("/act", { id: j.id, do: "resume" }));
+    if (j.state === "failed") { const a = el("a", "button", c.actions); a.textContent = "Debug report";
+      a.href = `/report/${j.id}?t=${token}`; }
     if (j.state === "done" && j.path) { const a = el("a", "button", c.actions); a.textContent = j.playlist ? "Videos" : "Open";
       a.href = `/play/${j.id}?t=${token}`; }
     if (j.state === "done" && j.folder) { const a = el("a", "button", c.actions); a.textContent = "Show in Files"; a.href = j.folder; }

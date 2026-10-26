@@ -102,6 +102,23 @@ It's a small web server in iSH-AOK (`web.py`), on 127.0.0.1 only and with a new 
 
 All of these screens come from `dl` itself; the shortcut only shows them. So new menus arrive with `dl`'s updates, without importing a new shortcut. With **🖼 Pictures in menus** off, they're plain lines of text.
 
+## When a download fails
+
+Every failure leaves a **debug report** in your Downloads folder in Files, `aria2-debug.txt`, replaced each time. It has what's needed to see what went wrong:
+- the phone's setup and the versions of the tools
+- the settings and the list of downloads
+- the failed download's whole log: `yt-dlp` runs in verbose mode, so the log has every step it took and the full error
+- the last lines of the updates and of the live view
+
+It leaves out your Bark key and the live view's token. It does include the links and names of your downloads.
+
+To send one to whoever helps you, either:
+- tap the failed download and then **🐞 Copy a debug report** (or **⚙️ Settings → 🐞 Copy a debug report** for the latest failure), and paste it into a message, or
+- tap **Debug report** on its card in the live view, then **Copy the report**, or
+- attach `aria2-debug.txt` from Files.
+
+Nothing is sent anywhere by itself.
+
 ## Notifications
 
 `dl` can send a notification when a download finishes, saying what was downloaded. Tapping it opens the file (or a playlist's folder) in the Files app. A failed download gets one too. They're off until you turn them on in **⚙️ Settings → 🔔 Notifications**.
@@ -136,6 +153,7 @@ dl -s          the list with progress bars
 dl -p | -r     pause all | resume all
 dl -c          clear finished from the list
 dl -u | -v     update aria2 and its tools now | show the tools' versions
+dl --report    a debug report for the latest failed download (--report <id> for another)
 ```
 
 ## Signing on a Mac instead

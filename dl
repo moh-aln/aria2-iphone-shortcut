@@ -11,6 +11,7 @@
 #   dl -p | -r | -c       pause all, resume all, clear finished from the list (files stay)
 #   dl -u | -v            update aria2 and its tools now | show the tools' versions
 #   dl <Bark link>        get a notification when a download ends, through the Bark app
+#   dl --report [<id>]    a debug report, to send for help when a download goes wrong
 #
 # Finished downloads land in /root/Downloads, or in /mnt/phone when a Files folder is
 # mounted there (see SHARE below).
@@ -68,8 +69,9 @@ is_video_site() {
 
 # Is <pid> the worker of download <id>, and not a zombie?
 alive() {
-  [ -n "$1" ] && [ -r "/proc/$1/stat" ] && read -r _ _ state _ <"/proc/$1/stat" &&
-    [ "$state" != Z ] && tr '\0' ' ' <"/proc/$1/cmdline" | grep -q -- "--work $2 *\$"
+  # pstate, not state: load's callers read $state afterwards.
+  [ -n "$1" ] && [ -r "/proc/$1/stat" ] && read -r _ _ pstate _ <"/proc/$1/stat" &&
+    [ "$pstate" != Z ] && tr '\0' ' ' <"/proc/$1/cmdline" | grep -q -- "--work $2 *\$"
 }
 
 running() { alive "$(cat "$JOBS/$1.pid" 2>/dev/null)" "$1"; }
@@ -127,7 +129,9 @@ fetch_video() {  # fetch_video <link> <id>
   # A playlist link downloads the playlist into a folder named after it; a video link that
   # happens to come from a playlist (watch?v=…&list=…) downloads just that video.
   # Before each video, its picture is fetched in the background for the menus (see thumb).
-  yt-dlp --newline --no-playlist --no-mtime -P "$DEST" -o '%(playlist_title|.).80B/%(title).80B.%(ext)s' \
+  # -v puts yt-dlp's versions and every step it takes in the log, for the debug report
+  # (see report); the list leaves its "[debug]" lines out.
+  yt-dlp -v --newline --no-playlist --no-mtime -P "$DEST" -o '%(playlist_title|.).80B/%(title).80B.%(ext)s' \
     -f 'bv*[vcodec^=avc1]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b' --merge-output-format mp4 $js \
     --exec 'before_dl:echo NAME: %(title)q' --exec 'after_move:echo FILE: %(filepath)q' \
     --exec "before_dl:sh '$0' --thumb $2 %(thumbnail)q >/dev/null 2>&1 &" \
@@ -162,6 +166,9 @@ work() {  # work <id>: the background worker, for as long as the download takes
   fi
   echo "=== exit $code"
   announce "$1"
+  # A failure leaves a debug report in Files, ready to send to whoever helps.
+  load "$1"
+  [ "$state" = failed ] && save_report "$1"
   update_if_due
   rest_unless_busy "$1"
 }
@@ -302,7 +309,8 @@ deliver() {  # deliver <id>: move the finished download into $SHARE, if that's m
 place() {
   to=$2
   if [ -e "$to" ]; then
-    if [ "$(stat -c %s "$1")" = "$(stat -c %s "$to" 2>/dev/null)" ]; then
+    size=$(stat -c %s "$1" 2>/dev/null)
+    if [ -n "$size" ] && [ "$size" = "$(stat -c %s "$to" 2>/dev/null)" ]; then
       rm -f "$1"
       printf '%s\n' "$to"
       return
@@ -366,7 +374,7 @@ load() {
   # What yt-dlp is doing before the download starts, from lines like
   # "[youtube] FOv2CAItUBs: Downloading player 1a2b3c4d": "Downloading player 1a2b3c4d".
   # "[youtube] [jsc:quickjs] Solving JS challenges" becomes "Solving JS challenges".
-  step=$(printf '%s\n' "$seg" | grep -E '^\[[A-Za-z:_]+\] ' | grep -v -E '^\[(Exec|download)\]' |
+  step=$(printf '%s\n' "$seg" | grep -E '^\[[A-Za-z:_]+\] ' | grep -v -E '^\[(Exec|download|debug)\]' |
     tail -n 1 | sed 's/^\(\[[^]]*\] \)*//; s/^[^ :]*: //' | cut -c1-48)
   case $seg in *'=== moving to Files'*) step='moving to Files' pct= ;; esac
   [ "$state" = running ] && [ -z "$pct" ] && preparing
@@ -741,7 +749,7 @@ render() {
       n = split("⬅️ back 📥 downloads ⬇️ downloads ➕ add 📂 folder 📦 folder ⚙️ settings 🆕 new " \
         "🔔 bell 🔕 belloff ⬆️ update 🔧 tools 📲 app ⏸ pause ▶️ play ⏹ stop 🔁 retry " \
         "🔄 refresh 🗑 trash ℹ️ info ✅ done ⚠️ failed 🧹 clear 🖼 pictures ⏳ prep0 " \
-        "1️⃣ appstore 2️⃣ copy 3️⃣ paste 📊 live 📤 share 🔗 copy ➖ remove", w, " ")
+        "1️⃣ appstore 2️⃣ copy 3️⃣ paste 📊 live 📤 share 🔗 copy ➖ remove 🐞 bug", w, " ")
       for (i = 1; i < n; i += 2) pic[w[i]] = w[i + 1]
       printf "" > menu
     }
@@ -828,6 +836,8 @@ tapped() {  # tapped <key>: act on the row tapped. Fails after printing an answe
     share) load "$id"; echo "@@share:$link"; return 1 ;;
     delete) screen="confirm $id" ;;
     delete-yes) notice "$(delete_download "$id")"; screen=list ;;
+    report) report_answer || return 1 ;;
+    report:*) report_answer "${1#report:}" || return 1 ;;
     notifications) screen=notifications ;;
     update-app)
       if [ -s "$SHORTCUTS/.pending" ]; then
@@ -1015,7 +1025,9 @@ item_screen() {  # item_screen <id>
       web_ok && row "live:$1" 📊 "Watch live" "A progress bar that moves as it downloads"
       stop_row ;;
     paused) row resume ▶️ Resume "From where it stopped"; stop_row ;;
-    failed) row resume 🔁 "Try again" "From where it stopped" ;;
+    failed)
+      row resume 🔁 "Try again" "From where it stopped"
+      report_row "report:$1" "What went wrong" ;;
     done)
       if web_ok; then
         row open ▶️ Open "Plays it right here"
@@ -1087,6 +1099,7 @@ settings_screen() {
   if [ -n "$SHORTCUT" ]; then
     row pictures 🖼 "Pictures in menus" "$(on_off_flag "$JOBS/.plain")"
   fi
+  report_row report "Everything aria2 knows"
   row ish 📲 "Open iSH-AOK" "The terminal behind aria2"
 }
 
@@ -1218,6 +1231,96 @@ delete_download() {  # delete_download <id>: prints what it did, as a title line
     echo "Couldn't delete $name"
     echo "Delete it in the Files app instead"
   fi
+}
+
+# ---- Debug reports: what to send whoever helps when something goes wrong ----
+
+# report [<id>]: the phone's setup, the tools, the settings, the list, the whole log of the
+# download (or of the latest failed one) and what the updates and the live view said. It
+# leaves out the Bark key and the live view's token. Quick enough for a Run Command.
+report() {
+  rid=$1  # not id: status below uses that
+  if [ -z "$rid" ]; then  # the latest failed download, else the latest one
+    for i in $(ids); do
+      load "$i"
+      [ "$state" = failed ] && { rid=$i; break; }
+    done
+    [ -n "$rid" ] || rid=$(ids | head -n 1)
+  fi
+  echo "aria2 debug report · $(date)"
+  echo "dl $(sha256sum <"$0" | cut -c1-8) · shortcut $(cat "$SHORTCUTS/.version" 2>/dev/null || echo '?')${SHORTCUT:+ (this one: $SHORTCUT)} · Alpine $(cat /etc/alpine-release 2>/dev/null || echo '?') · $(uname -m)"
+  echo "yt-dlp $(cat "$JOBS/.yt-dlp-version" 2>/dev/null || echo '?') at $(command -v yt-dlp) · $(aria2c --version 2>/dev/null | head -n 1)"
+  tools=
+  for tool in ffmpeg node qjs python3 curl; do
+    if command -v $tool >/dev/null; then tools="$tools $tool"; else tools="$tools (no $tool)"; fi
+  done
+  echo "Tools:$tools"
+  echo "Free space: $(df -h "$DEST" 2>/dev/null | awk 'NR == 2 { print $4 }') · Files folder: $(share_ready && share_host || echo 'none mounted')"
+  awake=no
+  pgrep -f 'dd if=/dev/location' >/dev/null && awake=yes
+  echo "Keeping iSH-AOK awake: $awake · /dev/location: $([ -e /dev/location ] && echo yes || echo no)"
+  echo "Settings: notifications $(on_off "$JOBS/.bark") · automatic updates $(auto_updates && echo on || echo off) · pictures $(on_off_flag "$JOBS/.plain")"
+  echo
+  echo "== The list"
+  status
+  if [ -n "$rid" ] && [ -f "$JOBS/$rid.log" ]; then
+    load "$rid"
+    worker=no
+    running "$rid" && worker=yes
+    echo
+    echo "== Download #$rid: $state${reason:+ ($reason)} · worker running: $worker"
+    # Progress lines and aria2's summaries repeat every second or so: keep the last one.
+    awk '/^\[#/ { last = $0; next }
+      /^\*\*\* Download Progress Summary/ || /^-+$/ || /^ *$/ { next }
+      $0 == previous { next }
+      { if (last != "") { print last; last = "" } print; previous = $0 }
+      END { if (last != "") print last }' "$JOBS/$rid.log" | tail -n 300
+  fi
+  for log in .update.log .app-update.log .web.log; do
+    [ -s "$JOBS/$log" ] || continue
+    echo
+    echo "== $log"
+    tail -n 25 "$JOBS/$log"
+  done
+}
+
+save_report() {  # save_report [<id>]: into .logs/report.txt, and into Files as aria2-debug.txt
+  new_report "$1"
+  report_to_files
+}
+
+new_report() {  # downloads that fail at once mustn't write into the same file
+  report "$1" >"$JOBS/report.txt.$$" 2>&1
+  mv -f "$JOBS/report.txt.$$" "$JOBS/report.txt"
+}
+
+report_to_files() {  # under another name first: writing into a file Files has open can hang
+  share_ready || return 0
+  timeout 30 cp "$JOBS/report.txt" "$SHARE/.aria2-debug.txt.new" &&
+    timeout 30 mv -f "$SHARE/.aria2-debug.txt.new" "$SHARE/aria2-debug.txt"
+}
+
+report_row() {  # report_row <key> <what it covers>
+  if [ "$LEVEL" -ge 3 ]; then
+    row "$1" 🐞 "Copy a debug report" "$2, to paste for help"
+  else
+    row "$1" 🐞 "Save a debug report" "$2: aria2-debug.txt, in Downloads"
+  fi
+}
+
+# report_answer [<id>]: a fresh report, copied (level 3) and saved in Files. Fails after an
+# answer for the Shortcut.
+report_answer() {
+  new_report "$1"
+  report_to_files >/dev/null 2>&1 </dev/null &  # Files may be slow; the copy isn't
+  if [ "$LEVEL" -ge 3 ]; then
+    notice "Copied a debug report" "Paste it into a message to whoever helps you"
+    printf '@@copy:'
+    cat "$JOBS/report.txt"
+    return 1
+  fi
+  notice "Saved a debug report" "aria2-debug.txt, in your Downloads folder"
+  return 0
 }
 
 # ---- The live view: web.py, a small web server, shown in the shortcut's Safari sheet ----
@@ -1367,6 +1470,7 @@ case $1 in
   --act) web_act "$2" "$3" ;;      # the live view's buttons (web.py)
   --awake) keep_awake ;;           # while the live view is open
   --rest) rest_unless_busy ;;      # when it closes
+  --report) report "$2" ;;         # a debug report (see report)
   --update)
     keep_awake
     case $2 in tools | app) update_now "$2" ;; *) update_now tools; update_now app ;; esac
@@ -1380,6 +1484,6 @@ case $1 in
   -p | -x) pause_all ;;
   -r) resume_all ;;
   -c) clear_finished ;;
-  '' | -h | --help) sed -n '2,16p' "$0" ;;
+  '' | -h | --help) sed -n '2,17p' "$0" ;;
   *) add_links "$*" ;;
 esac
