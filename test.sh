@@ -1,0 +1,192 @@
+#!/bin/sh
+# Checks dl on a computer, the way the iPhone runs it: BusyBox ash and BusyBox's text tools,
+# links base64-encoded. Needs aria2c, yt-dlp, busybox, curl, python3 (for a local web page
+# with a video in it) and internet access. Run: sh test.sh
+set -u
+here=$(cd "$(dirname "$0")" && pwd)
+tmp=$(mktemp -d)
+export DL_DIR="$tmp/Downloads"
+# Stands in for the Files folder mounted at /mnt/phone: finished downloads move here.
+export DL_SHARE="$tmp/Share"
+mkdir "$DL_SHARE"
+# Stand-ins for /root/Shortcuts and for the setup script in the project's repository.
+export DL_SHORTCUTS="$tmp/Shortcuts"
+mkdir "$DL_SHORTCUTS"
+
+# A local site: a page with a video in it, and a page without one.
+mkdir "$tmp/www"
+curl -sSL -o "$tmp/www/rabbit.mp4" \
+  https://raw.githubusercontent.com/mdn/learning-area/main/html/multimedia-and-embedding/video-and-audio-content/rabbit320.mp4
+printf '<!doctype html><title>Rabbit test page</title><video src="rabbit.mp4"></video>\n' >"$tmp/www/video.html"
+printf '<!doctype html><title>Just text</title><p>No video here.</p>\n' >"$tmp/www/text.html"
+cp "$tmp/www/rabbit.mp4" "$tmp/www/rabbit2.mp4"
+printf '<!doctype html><title>Rabbit playlist</title><video src="rabbit.mp4"></video><video src="rabbit2.mp4"></video>\n' \
+  >"$tmp/www/playlist.html"
+port=18780
+export DL_UPDATE_URL=http://127.0.0.1:$port/setup.sh
+printf '#!/bin/sh\necho ran >>"%s/setup-runs"\nsha256sum <"$0" | cut -d" " -f1 >"$DL_DIR/.logs/.setup"\n' "$tmp" \
+  >"$tmp/www/setup.sh"
+python3 -I -m http.server $port --bind 127.0.0.1 --directory "$tmp/www" >/dev/null 2>&1 &
+server=$!
+trap 'kill $server; pkill -f "$tmp"; pkill -f "$here/dl --work"; rm -rf "$tmp"' EXIT
+
+# Alpine's BusyBox has nohup, pgrep and pkill; Ubuntu's doesn't, so those come from the system.
+# aria2c and yt-dlp are slowed down so a download is still running when the checks look at it.
+mkdir "$tmp/bin"
+for tool in busybox sh awk base64 cat cut date dd du find grep head ls mkdir mv rm rmdir sed seq setsid sha256sum sleep sort tail timeout tr wc; do
+  ln -s "$(command -v busybox)" "$tmp/bin/$tool"
+done
+for tool in nohup pgrep pkill kill curl; do ln -s "$(command -v $tool)" "$tmp/bin/$tool"; done
+printf '#!/bin/sh\nexec %s --max-overall-download-limit=50K "$@"\n' "$(command -v aria2c)" >"$tmp/bin/aria2c"
+printf '#!/bin/sh\nexec %s --limit-rate 25K "$@"\n' "$(command -v yt-dlp)" >"$tmp/bin/yt-dlp"
+chmod +x "$tmp/bin/aria2c" "$tmp/bin/yt-dlp"
+PATH=$tmp/bin
+
+fails=0
+dl() { busybox ash "$here/dl" "$@"; }
+b64() { printf %s "$1" | base64 | tr -d '\n'; }
+check() { # check <description> <haystack> <needle>
+  case $2 in *"$3"*) echo "ok    $1" ;; *) echo "FAIL  $1: wanted '$3' in:"; echo "$2"; fails=$((fails + 1)) ;; esac
+}
+# act <menu line>: what the Shortcut does when a line is chosen
+act() { dl -a -b "$(b64 "$1")"; }
+line_for() { dl -s | grep -F "$1"; }
+log_of() { cat "$DL_DIR/.logs/$1.log"; }
+
+SMALL=https://raw.githubusercontent.com/aria2/aria2/master/NEWS                                 #1
+BIG=https://github.com/aria2/aria2/releases/download/release-1.37.0/aria2-1.37.0.tar.xz         #2
+MISSING=https://raw.githubusercontent.com/aria2/aria2/master/NOPE_404                           #3
+HOSTILE='https://raw.githubusercontent.com/x/$(touch '"$tmp"'/PWNED);touch '"$tmp"'/PWNED2'    #4
+MAGNET='magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=Nobody+Shares+This'    #5
+VIDEO_PAGE=http://127.0.0.1:$port/video.html                                                    #6
+TEXT_PAGE=http://127.0.0.1:$port/text.html                                                      #7
+YOUTUBE=https://www.youtube.com/watch?v=aqz-KE-bpKQ                                             #8
+PLAYLIST_PAGE=http://127.0.0.1:$port/playlist.html                                              #9
+
+out=$(dl -s)
+check "empty list" "$out" "No downloads yet."
+
+out=$(dl -b "$(b64 "see $SMALL!")")
+check "finds a link in text and drops trailing punctuation" "$out" "Started: NEWS"
+out=$(dl -b "$(printf %s "$BIG $MISSING" | busybox base64)")
+check "base64 with line breaks and several links" "$out" "Started: NOPE_404"
+dl -b "$(b64 "$HOSTILE")" >/dev/null
+dl "$MAGNET" >/dev/null
+dl "$VIDEO_PAGE" "$TEXT_PAGE" >/dev/null
+out=$(dl "$YOUTUBE")
+check "a YouTube link is named after the site until the title is known" "$out" "Started: youtube.com video"
+out=$(dl -b "$(b64 'no links here')"); code=$?
+check "says so when there is no link" "$out" "No link found"
+[ "$code" = 1 ] || { echo "FAIL  exit code $code for no link"; fails=$((fails + 1)); }
+
+sleep 8
+[ ! -e "$tmp/PWNED" ] && [ ! -e "$tmp/PWNED2" ] && echo "ok    shell syntax in a link is never run" ||
+  { echo "FAIL  shell syntax in a link ran"; fails=$((fails + 1)); }
+check "a file link goes to aria2" "$(log_of 2)" "=== via aria2"
+check "a magnet goes to aria2" "$(log_of 5)" "=== via aria2"
+check "a web page goes to yt-dlp" "$(log_of 6)" "=== via yt-dlp"
+check "a YouTube link goes to yt-dlp" "$(log_of 8)" "=== via yt-dlp"
+out=$(dl -s)
+check "status: finished download, with its size" "$out" "✅ NEWS · "
+[ -e "$DL_SHARE/NEWS" ] && [ ! -e "$DL_DIR/NEWS" ] && echo "ok    a finished download moves to the shared folder" ||
+  { echo "FAIL  NEWS wasn't moved to the shared folder"; ls "$DL_DIR" "$DL_SHARE"; fails=$((fails + 1)); }
+check "status: failed download and why" "$out" "⚠️ NOPE_404 · failed: Resource not found"
+check "status: aria2 progress bar, speed and time left" "$(line_for aria2-1.37.0)" "left  #2"
+check "status: magnet shows its name" "$out" "⬇️ starting… · Nobody Shares This  #5"
+check "status: video progress bar under the page's title" "$(line_for '#6')" "% · Rabbit test page"
+check "status: a page without a video" "$out" "⚠️ text.html · failed: no video found on this page  #7"
+check "status: yt-dlp's own error shows (YouTube is unreachable from a test machine)" "$(line_for '#8')" "· failed: "
+
+out=$(dl "$BIG")
+check "sharing a running link again" "$out" "Already downloading: aria2-1.37.0.tar.xz"
+out=$(dl "${YOUTUBE}&si=FromTheShareSheet")
+case $out in Started*) echo "FAIL  the same YouTube video with a si= tag became a new download: $out"; fails=$((fails + 1)) ;;
+  *) echo "ok    a YouTube link's si= tag is ignored" ;; esac
+[ ! -e "$DL_DIR/.logs/9.log" ] || { echo "FAIL  a 9th download was made"; fails=$((fails + 1)); }
+[ -e "$DL_DIR/.logs/.updated" ] && echo "ok    tools are updated after the first download of the day" ||
+  { echo "FAIL  no .updated after a download"; fails=$((fails + 1)); }
+check "versions" "$(dl -v)" "Tools last updated: "
+[ "$(cat "$tmp/setup-runs" 2>/dev/null)" = ran ] && echo "ok    the daily update runs the repository's setup" ||
+  { echo "FAIL  setup from the repository didn't run once: $(cat "$tmp/setup-runs" 2>/dev/null)"; fails=$((fails + 1)); }
+update_and_wait() {
+  dl -u >/dev/null
+  sleep 1
+  for try in $(seq 30); do [ -d "$DL_DIR/.logs/.updating" ] || break; sleep 1; done
+}
+update_and_wait
+[ "$(wc -l <"$tmp/setup-runs")" = 1 ] && echo "ok    an unchanged setup isn't run again" ||
+  { echo "FAIL  unchanged setup ran again"; fails=$((fails + 1)); }
+echo '# a newer version' >>"$tmp/www/setup.sh"
+update_and_wait
+[ "$(wc -l <"$tmp/setup-runs")" = 2 ] && echo "ok    a changed setup is run" ||
+  { echo "FAIL  changed setup didn't run"; fails=$((fails + 1)); }
+echo "Files -> On My iPhone -> Downloads -> aria2-test.shortcut" >"$DL_SHORTCUTS/.pending"
+pending=$(dl -m | grep '^🆕')
+check "a new shortcut is announced in the menu" "$pending" "🆕 New shortcut: Files -> On My iPhone -> Downloads -> aria2-test.shortcut."
+check "tapping the announcement" "$(act "$pending")" "Done."
+[ ! -e "$DL_SHORTCUTS/.pending" ] && echo "ok    the announcement goes away" ||
+  { echo "FAIL  .pending still there"; fails=$((fails + 1)); }
+
+dl "$PLAYLIST_PAGE" >/dev/null
+for try in $(seq 30); do line_for '#9' | grep -q 'video 1 of 2 · [0-9]' && break; sleep 1; done
+check "a playlist shows as one download, with which video it's on" "$(line_for '#9')" "video 1 of 2 · "
+check "a playlist is named after the playlist" "$(line_for '#9')" "📃 Rabbit playlist  #9"
+
+out=$(dl -m)
+check "menu: downloads then actions" "$out" "#1
+➕ Add link from clipboard"
+check "menu: ends with close" "$out" "📲 Open iSH-AOK
+❌ Close"
+check "menu: update tools" "$out" "🔧 Update tools"
+
+out=$(act "$(line_for aria2-1.37.0)")
+check "tapping a running download pauses it" "$out" "Paused: aria2-1.37.0.tar.xz"
+check "paused line keeps its progress" "$(line_for aria2-1.37.0)" "% · aria2-1.37.0.tar.xz · paused  #2"
+out=$(act "$(line_for aria2-1.37.0)")
+check "tapping it again resumes it" "$out" "Resumed: aria2-1.37.0.tar.xz"
+sleep 7
+check "resumed download is running" "$(line_for aria2-1.37.0)" "⬇️ "
+[ -e "$DL_DIR/aria2-1.37.0.tar.xz.aria2" ] && echo "ok    resume continues from the saved point" ||
+  { echo "FAIL  no aria2 control file after resume"; fails=$((fails + 1)); }
+
+out=$(act "$(line_for '#6')")
+check "pausing a video" "$out" "Paused: Rabbit test page"
+ls "$DL_DIR" | grep -q 'Rabbit test page.*\.part$' && echo "ok    a paused video keeps its partial file" ||
+  { echo "FAIL  no .part file for the paused video"; fails=$((fails + 1)); }
+pgrep -f "Downloads.*video.html" >/dev/null && { echo "FAIL  yt-dlp still running after pause"; fails=$((fails + 1)); } ||
+  echo "ok    pausing stops yt-dlp"
+
+out=$(act "⏸ Pause all")
+check "pause all" "$out" "Paused all downloads."
+check "pause all: magnet paused" "$(line_for Nobody)" "⏸ Nobody Shares This · paused  #5"
+out=$(act "▶️ Resume all")
+# The aria2 file, the magnet, the video, the playlist, and the YouTube link if its re-share is still retrying.
+case $out in "Resumed 4 download(s)." | "Resumed 5 download(s).") echo "ok    resume all" ;;
+  *) echo "FAIL  resume all: $out"; fails=$((fails + 1)) ;; esac
+out=$(act "✅ NEWS  #1")
+check "tapping a finished download" "$out" "Already finished: NEWS"
+out=$(dl "$SMALL")
+check "sharing a finished link again" "$out" "Already downloaded: NEWS"
+out=$(act "🔄 Refresh")
+check "refresh does nothing" "[$out]" "[]"
+
+for try in $(seq 60); do line_for '#6' | grep -q ✅ && break; sleep 1; done
+check "resumed video finishes, named after its file" "$(line_for '#6')" "✅ Rabbit test page"
+ls "$DL_SHARE" | grep -q '^Rabbit test page.*\.mp4$' && echo "ok    the video is saved as an mp4, in the shared folder" ||
+  { echo "FAIL  no mp4 saved"; ls "$DL_DIR"; fails=$((fails + 1)); }
+
+for try in $(seq 150); do line_for '#9' | grep -q ✅ && break; sleep 1; done
+check "a finished playlist says how many videos" "$(line_for '#9')" "✅ 📃 Rabbit playlist · 2 videos · "
+[ "$(ls "$DL_SHARE/Rabbit playlist" 2>/dev/null | grep -c '\.mp4$')" = 2 ] && [ ! -e "$DL_DIR/Rabbit playlist" ] &&
+  echo "ok    the playlist's folder moves to the shared folder" ||
+  { echo "FAIL  playlist folder not moved"; find "$DL_DIR" "$DL_SHARE"; fails=$((fails + 1)); }
+
+dl -p >/dev/null
+out=$(act "🧹 Clear finished")
+check "clear finished" "$out" "finished download(s). The files are still in Downloads."
+out=$(dl -s)
+case $out in *NEWS* | *NOPE_404* | *Rabbit*) echo "FAIL  cleared downloads still listed"; fails=$((fails + 1)) ;;
+  *) echo "ok    cleared downloads leave the list" ;; esac
+[ -e "$DL_SHARE/NEWS" ] && echo "ok    clearing keeps the files" || { echo "FAIL  NEWS was deleted"; fails=$((fails + 1)); }
+
+[ "$fails" = 0 ] && echo "All checks passed." || { echo "$fails check(s) failed."; exit 1; }

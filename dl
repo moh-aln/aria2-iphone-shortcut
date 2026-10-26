@@ -1,0 +1,499 @@
+#!/bin/sh
+# dl: download links in the background, into a folder the Files app can see. Pages with a
+# video in them (YouTube, Instagram, X, TikTok and many more) go to yt-dlp, files to aria2.
+#
+#   dl <link>...          download links (a link that's already in the list is resumed)
+#   dl -b <base64 text>   same, with the text base64-encoded (what the Shortcut sends).
+#                         Every http(s), ftp, sftp and magnet link in it is downloaded.
+#   dl -s                 one line per download, with a progress bar
+#   dl -m                 those lines plus the actions: the Shortcut's menu
+#   dl -a -b <base64>     do what a chosen menu line says (a download line pauses or resumes it)
+#   dl -p | -r | -c       pause all, resume all, clear finished from the list (files stay)
+#   dl -u | -v            update yt-dlp and the other tools now | show their versions
+#
+# Finished downloads land in /root/Downloads, or in /mnt/phone when a Files folder is
+# mounted there (see SHARE below).
+
+DEST=${DL_DIR:-/root/Downloads}
+JOBS=$DEST/.logs
+# Finished downloads are moved into this folder when it's there: a Files folder mounted into
+# iSH-AOK with `mount -t ios phone /mnt/phone` (such as On My iPhone → Downloads), for when
+# Files can't open iSH-AOK's own location. Downloading itself always happens in $DEST.
+SHARE=${DL_SHARE:-/mnt/phone}
+# Where setup-on-phone.sh keeps the signed shortcut, and where updates come from.
+SHORTCUTS=${DL_SHORTCUTS:-/root/Shortcuts}
+UPDATE_URL=${DL_UPDATE_URL:-https://raw.githubusercontent.com/moh-aln/aria2-iphone-shortcut/main/shortcuts/setup-on-phone.sh}
+LINK_RE='(https?|s?ftp|magnet):[^[:space:]"<>]+'
+SHOWN=10  # downloads in the list, newest first
+# Links to these sites are pages with a video in them. Any other web link is checked
+# when its download starts: a web page goes to yt-dlp too, anything else to aria2.
+VIDEO_SITES='youtube.com youtu.be instagram.com x.com twitter.com tiktok.com facebook.com
+  fb.watch reddit.com redd.it vimeo.com twitch.tv dailymotion.com soundcloud.com threads.net
+  threads.com bsky.app pinterest.com pin.it bilibili.com streamable.com'
+
+mkdir -p "$JOBS"
+
+# A download is $JOBS/<id>.log and $JOBS/<id>.pid. The log's first line is the link. Each
+# (re)start appends "=== start", "=== via <tool>", the tool's output, then "=== exit <code>",
+# or "=== paused" when it's paused. The pid is the background worker running the tool.
+ids() {
+  for f in "$JOBS"/*.log; do
+    id=${f##*/}
+    id=${id%.log}
+    case $id in '' | *[!0-9]*) continue ;; esac
+    echo "$id"
+  done | sort -rn
+}
+
+decode() { printf %s "$1" | tr -d ' \r\n' | base64 -d 2>/dev/null; }
+
+host_of() {
+  h=$(printf %s "$1" | sed -E 's|^[a-z]+://([^/:?#]*).*|\1|' | tr 'A-Z' 'a-z')
+  printf %s "${h#www.}"
+}
+
+is_video_site() {
+  h=$(host_of "$1")
+  for site in $VIDEO_SITES; do
+    case $h in "$site" | *."$site") return 0 ;; esac
+  done
+  return 1
+}
+
+# Is <pid> the worker of download <id>, and not a zombie?
+alive() {
+  [ -n "$1" ] && [ -r "/proc/$1/stat" ] && read -r _ _ state _ <"/proc/$1/stat" &&
+    [ "$state" != Z ] && tr '\0' ' ' <"/proc/$1/cmdline" | grep -q -- "--work $2 *\$"
+}
+
+running() { alive "$(cat "$JOBS/$1.pid" 2>/dev/null)" "$1"; }
+
+start() {  # start <link> <id>
+  log=$JOBS/$2.log
+  [ -f "$log" ] || printf '%s\n' "$1" >"$log"
+  echo "=== start $(date)" >>"$log"
+  # Output goes to the log, not the caller, so the Shortcut's Run Command returns at once.
+  # setsid gives the download its own process group, so pausing stops all of it.
+  $(command -v setsid) nohup sh "$0" --work "$2" >>"$log" 2>&1 </dev/null &
+  echo $! >"$JOBS/$2.pid"
+}
+
+# iOS pauses iSH-AOK soon after it leaves the screen, unless iSH-AOK is getting location
+# updates (with location access set to Always). So read /dev/location while anything is
+# downloading, and stop once nothing is, to save battery.
+keep_awake() {
+  [ -e /dev/location ] || return 0
+  pgrep -f 'dd if=/dev/location' >/dev/null && return 0
+  nohup dd if=/dev/location of=/dev/null bs=64 >/dev/null 2>&1 </dev/null &
+}
+
+rest_unless_busy() {  # rest_unless_busy <id of the download that's ending>
+  for id in $(ids); do
+    [ "$id" != "$1" ] && running "$id" && return 0
+  done
+  pkill -f 'dd if=/dev/location' 2>/dev/null
+}
+
+fetch_file() {
+  # --file-allocation=none: don't write zeros for the whole file up front (slow on a phone).
+  # --max-tries/--retry-wait: ride out the connection drops iOS causes when it suspends the app.
+  # --seed-time=0: stop a torrent as soon as it finishes instead of seeding.
+  # --bt-stop-timeout: give up on a torrent that has had no data for 15 minutes.
+  aria2c --dir="$DEST" --continue=true --file-allocation=none \
+    --max-tries=20 --retry-wait=15 --seed-time=0 --bt-stop-timeout=900 \
+    --follow-torrent=mem --enable-color=false \
+    --show-console-readout=false --summary-interval=5 "$1"
+}
+
+fetch_video() {
+  # The JavaScript engine yt-dlp uses to work out YouTube's video links: Node when it's
+  # installed (about 4 times faster than QuickJS in iSH-AOK on an iPhone), else QuickJS.
+  js=
+  if command -v node >/dev/null; then
+    js='--js-runtimes node'
+  elif command -v qjs >/dev/null; then
+    js='--js-runtimes quickjs'
+  fi
+  # Prefer H.264 in MP4, which the iPhone plays everywhere. Progress is printed in the
+  # same shape as aria2's summaries, so the list reads both the same way. The title and
+  # the final file come from --exec, not --print, which would hide yt-dlp's other output:
+  # the step it's on is what the list shows until the download starts.
+  # A playlist link downloads the playlist into a folder named after it; a video link that
+  # happens to come from a playlist (watch?v=…&list=…) downloads just that video.
+  yt-dlp --newline --no-playlist --no-mtime -P "$DEST" -o '%(playlist_title|.).80B/%(title).80B.%(ext)s' \
+    -f 'bv*[vcodec^=avc1]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b' --merge-output-format mp4 $js \
+    --exec 'before_dl:echo NAME: %(title)q' --exec 'after_move:echo FILE: %(filepath)q' \
+    --progress-template 'download:[#yt %(progress._downloaded_bytes_str)s/%(progress._total_bytes_str)s(%(progress._percent_str)s) DL:%(progress._speed_str)s ETA:%(progress._eta_str)s]' \
+    "$1"
+}
+
+work() {  # work <id>: the background worker, for as long as the download takes
+  link=$(head -n 1 "$JOBS/$1.log")
+  keep_awake
+  tool=aria2
+  if is_video_site "$link"; then
+    tool=yt-dlp
+  else
+    case $link in http*)
+      type=$(curl -sL -m 20 -r 0-0 -o /dev/null -w '%{content_type}' "$link" 2>/dev/null)
+      case $type in text/html* | application/xhtml*) tool=yt-dlp ;; esac ;;
+    esac
+  fi
+  echo "=== via $tool"
+  # Run the tool as a child, so that without setsid a pause still reaches it.
+  child=
+  trap 'kill $child 2>/dev/null' TERM
+  if [ $tool = yt-dlp ]; then fetch_video "$link" & else fetch_file "$link" & fi
+  child=$!
+  wait $child
+  code=$?
+  # A playlist where some videos failed still hands over the ones that worked (yt-dlp only
+  # says FILE: for finished files). A paused download stays put, so resuming finds its files.
+  if [ $code = 0 ] || { [ $tool = yt-dlp ] && ! segment "$1" | grep -q '^=== paused'; }; then
+    deliver "$1"
+  fi
+  echo "=== exit $code"
+  update_if_due
+  rest_unless_busy "$1"
+}
+
+segment() { # segment <id>: the log since the download's latest (re)start
+  awk '/^=== start/ { buf = "" } { buf = buf $0 "\n" } END { printf "%s", buf }' "$JOBS/$1.log"
+}
+
+# Tools are updated at most once a day, by the worker of a download that just ended:
+# yt-dlp from its own releases (YouTube changes often, and Alpine's package lags behind),
+# the rest from Alpine, and dl itself (with the shortcut) from the project's repository.
+# "🔧 Update tools" in the menu does it at once.
+update_tools() {
+  echo "=== update $(date)"
+  timeout 600 apk update -q && timeout 1800 apk add -q -u aria2 curl ffmpeg nodejs quickjs
+  case $(command -v yt-dlp) in /usr/local/bin/*) timeout 600 yt-dlp -U ;; esac
+  # The setup script installs dl and, when it changed, a new signed shortcut. Run the
+  # repository's copy only when it differs from the one last run here.
+  if timeout 120 curl -fsSL -o "$JOBS/.setup.new" "$UPDATE_URL" &&
+      [ "$(sha256sum <"$JOBS/.setup.new" | cut -d' ' -f1)" != "$(cat "$JOBS/.setup" 2>/dev/null)" ]; then
+    echo "=== new setup"
+    sh "$JOBS/.setup.new"
+  fi
+  rm -f "$JOBS/.setup.new"
+  date +%s >"$JOBS/.updated"
+  echo "=== updated"
+}
+
+update_now() {
+  # One update at a time; a lock older than an hour was left by an update iOS ended.
+  find "$JOBS" -maxdepth 1 -name .updating -mmin +60 -exec rmdir {} \; 2>/dev/null
+  mkdir "$JOBS/.updating" 2>/dev/null || return 0
+  update_tools >>"$JOBS/.update.log" 2>&1
+  rmdir "$JOBS/.updating"
+}
+
+update_if_due() {
+  last=$(cat "$JOBS/.updated" 2>/dev/null)
+  [ $(($(date +%s) - ${last:-0})) -ge 86400 ] && update_now
+}
+
+versions() {
+  echo "yt-dlp $(yt-dlp --version 2>/dev/null) ($(command -v yt-dlp))"
+  if command -v node >/dev/null; then echo "Node $(node --version) (used for YouTube)"; fi
+  echo "$(aria2c --version 2>/dev/null | head -n 1)"
+  # yt-dlp says QuickJS older than 2025-04-26 solves YouTube's challenges "very slowly".
+  if command -v qjs >/dev/null; then qjs -h 2>&1 | head -n 1; else echo "QuickJS: not installed"; fi
+  last=$(cat "$JOBS/.updated" 2>/dev/null)
+  echo "Tools last updated: $( [ -n "$last" ] && date -d "@$last" 2>/dev/null || echo never)"
+}
+
+share_ready() {
+  if [ -n "$DL_SHARE" ]; then
+    [ -d "$SHARE" ]
+  else
+    awk -v dir="$SHARE" '$2 == dir { found = 1 } END { exit !found }' /proc/mounts 2>/dev/null
+  fi
+}
+
+deliver() {  # deliver <id>: move the finished download into $SHARE, if that's mounted
+  share_ready || return 0
+  # yt-dlp says FILE: for each finished file. aria2 says it in its summaries, which a quick
+  # download may not live to print, and in its "Download Results" row: gid|OK|speed|path.
+  path=$(segment "$1" | sed -n 's/^FILE: //p' | tail -n 1)
+  [ -n "$path" ] || path=$(segment "$1" | grep -E '^[0-9a-f]+\|OK' | tail -n 1 | cut -d'|' -f4-)
+  case $path in "$DEST"/*) ;; *) return 0 ;; esac
+  # A playlist's or a torrent's file is in a folder: move that whole folder.
+  top=${path#"$DEST"/}
+  top=${top%%/*}
+  echo "=== moving to Files"
+  if [ -d "$DEST/$top" ]; then
+    # Merge into a folder of the same name, file by file, leaving out the partial files
+    # of anything unfinished and never overwriting.
+    (cd "$DEST" && find "$top" -type f ! -name '*.part' ! -name '*.ytdl' ! -name '*.aria2') |
+      while IFS= read -r f; do
+        [ -e "$SHARE/$f" ] && continue
+        mkdir -p "$SHARE/${f%/*}" && timeout 1800 mv "$DEST/$f" "$SHARE/$f"
+      done
+    find "$DEST/$top" -depth -type d -exec rmdir {} \; 2>/dev/null  # only the empty ones
+    echo "FILE: $SHARE/$top"
+  elif [ ! -e "$SHARE/$top" ] && timeout 1800 mv "$DEST/$top" "$SHARE/"; then
+    echo "FILE: $SHARE/$top"
+  fi
+}
+
+link_name() {
+  if is_video_site "$1"; then
+    printf '%s video' "$(host_of "$1")"
+    return
+  fi
+  case $1 in
+    magnet:*) n=$(printf %s "$1" | sed -n 's/.*[?&]dn=\([^&]*\).*/\1/p' | sed 's/+/ /g; s/%20/ /g') ;;
+    *) n=${1%%[?#]*}; n=${n%/}; n=${n##*/} ;;
+  esac
+  printf %s "${n:-$1}"
+}
+
+# load <id>: sets link, state (running, paused, done or failed), name, path, pct, speed, eta, reason.
+load() {
+  link=$(head -n 1 "$JOBS/$1.log")
+  # Only the output since the latest (re)start counts.
+  seg=$(segment "$1")
+  code=$(printf '%s\n' "$seg" | sed -n 's/^=== exit //p' | tail -n 1)
+  reason=
+  case $seg in
+    *'=== paused'*) state=paused ;;
+    *'=== exit '*)
+      if [ "$code" = 0 ]; then state=done; else state=failed; fi
+      reason=$(printf '%s\n' "$seg" | grep -E 'errorCode=|^ERROR: ' | tail -n 1 |
+        sed 's/.*errorCode=[0-9]* //; s/^ERROR: //; s/^\[[^]]*\] [^:]*: //; s/^Unsupported URL.*/no video found on this page/' |
+        cut -c1-120) ;;
+    *) if running "$1"; then state=running; else state=paused; fi ;;  # paused: iOS ended it
+  esac
+  # Progress lines look like [#e5d549 400KiB/1.6MiB(24%) CN:1 DL:67KiB ETA:18s] from aria2,
+  # or [#yt  254.00KiB/ 815.00KiB( 31.3%) DL: 149.78KiB/s ETA:00:03] from yt-dlp.
+  prog=$(printf '%s\n' "$seg" | grep '^\[#' | tail -n 1)
+  pct=$(printf %s "$prog" | sed -n 's/.*( *\([0-9]*\)[.0-9]*%).*/\1/p')
+  speed=$(printf %s "$prog" | sed -n 's/.* DL: *\([^] ]*\).*/\1/p')
+  speed=${speed%/s}
+  eta=$(printf %s "$prog" | sed -n 's/.* ETA:\([^]]*\)\].*/\1/p')
+  [ "$eta" = NA ] && eta=
+  # The name: the file once known (aria2 says FILE: in its summaries, yt-dlp at the end),
+  # else the video's title, else something from the link.
+  path=$(printf '%s\n' "$seg" | sed -n 's/^FILE: //p' | tail -n 1)
+  case $path in *'[METADATA]'*) path= ;; esac  # a magnet still fetching its file list
+  name=${path##*/}
+  [ -n "$name" ] || name=$(printf '%s\n' "$seg" | sed -n 's/^NAME: //p' | tail -n 1)
+  [ -n "$name" ] || name=$(link_name "$link")
+  # What yt-dlp is doing before the download starts, from lines like
+  # "[youtube] FOv2CAItUBs: Downloading player 1a2b3c4d": "Downloading player 1a2b3c4d".
+  # "[youtube] [jsc:quickjs] Solving JS challenges" becomes "Solving JS challenges".
+  step=$(printf '%s\n' "$seg" | grep -E '^\[[A-Za-z:_]+\] ' | grep -v -E '^\[(Exec|download)\]' |
+    tail -n 1 | sed 's/^\(\[[^]]*\] \)*//; s/^[^ :]*: //' | cut -c1-48)
+  case $seg in *'=== moving to Files'*) step='moving to Files' pct= ;; esac
+  # A playlist: "[download] Downloading playlist: <title>", then "Downloading item 3 of 12"
+  # before each video, and a FILE: line for each video that finished.
+  playlist=$(printf '%s\n' "$seg" | sed -n 's/^\[download\] Downloading playlist: //p' | tail -n 1)
+  [ -n "$playlist" ] || return 0
+  name="📃 $playlist"
+  item=$(printf '%s\n' "$seg" | sed -n 's/^\[download\] Downloading item \([0-9]*\) of \([0-9]*\)$/\1 \2/p' | tail -n 1)
+  n=${item%% *} total=${item##* }
+  [ -n "$item" ] || n=1 total=1
+  overall=$((((n - 1) * 100 + ${pct:-0}) / total))
+  videos=$(printf '%s\n' "$seg" | awk -v p="FILE: $DEST/" 'index($0, p) == 1' | wc -l)
+  errors=$(printf '%s\n' "$seg" | grep -c '^ERROR: ')
+  # Some videos failing doesn't make the playlist a failure.
+  [ "$state" = failed ] && [ "$videos" -gt 0 ] && state=done
+  [ -f "$path" ] && path=${path%/*}  # its folder, for the size
+}
+
+bar() {
+  b= i=0
+  while [ $i -lt 10 ]; do
+    if [ $i -lt $(($1 / 10)) ]; then b="$b▰"; else b="$b▱"; fi
+    i=$((i + 1))
+  done
+  printf %s "$b"
+}
+
+# One line per download. The " #<id>" at the end is how a chosen line finds its download again.
+line() {
+  if [ -n "$playlist" ]; then
+    playlist_line "$1"
+    return
+  fi
+  case $state in
+    running)
+      if [ -n "$pct" ]; then
+        echo "⬇️ $(bar "$pct") $pct% · $name · ${speed:-0B}/s${eta:+ · $eta left}  #$1"
+      else
+        echo "⬇️ ${step:-starting}… · $name  #$1"
+      fi ;;
+    paused) echo "⏸ ${pct:+$(bar "$pct") $pct% · }$name · paused  #$1" ;;
+    done)
+      size=$(du -sh "$path" 2>/dev/null | cut -f1)
+      echo "✅ $name${size:+ · $size}  #$1" ;;
+    failed) echo "⚠️ $name · failed${reason:+: $reason}  #$1" ;;
+  esac
+}
+
+# The bar for a playlist is the whole playlist: video 3 of 12 at 50% is 21%.
+playlist_line() {
+  case $state in
+    running)
+      if [ -n "$pct" ]; then
+        now="$pct% · ${speed:-0B}/s"
+      else
+        now="${step:-starting}…"
+      fi
+      echo "⬇️ $(bar "$overall") video $n of $total · $now · $name  #$1" ;;
+    paused) echo "⏸ $(bar "$overall") video $n of $total · $name · paused  #$1" ;;
+    done)
+      size=$(du -sh "$path" 2>/dev/null | cut -f1)
+      failed=
+      [ "$errors" -gt 0 ] && failed=", $errors failed"
+      echo "✅ $name · $videos videos$failed${size:+ · $size}  #$1" ;;
+    failed) echo "⚠️ $name · failed${reason:+: $reason}  #$1" ;;
+  esac
+}
+
+status() {
+  set -- $(ids | head -n $SHOWN)
+  [ $# -gt 0 ] || { echo "No downloads yet."; return; }
+  for id; do
+    load "$id"
+    line "$id"
+  done
+}
+
+add() {  # add <link>: start it, or resume it if it's already in the list
+  for id in $(ids); do
+    [ "$(head -n 1 "$JOBS/$id.log")" = "$1" ] || continue
+    load "$id"
+    case $state in
+      running) echo "Already downloading: $name" ;;
+      done) echo "Already downloaded: $name (clear finished to download it again)" ;;
+      *) start "$1" "$id"; echo "Resumed: $name" ;;
+    esac
+    return
+  done
+  last=$(ids | head -n 1)
+  start "$1" $((${last:-0} + 1))
+  echo "Started: $(link_name "$1")"
+}
+
+add_links() {
+  # Drop punctuation that ends a sentence rather than the link ("see https://x.com/a.zip.").
+  # YouTube's share links carry a "si=" tracking tag that differs on every share; drop it,
+  # so sharing the same video twice is the same download.
+  links=$(printf '%s\n' "$1" | grep -oE "$LINK_RE" | sed 's/[.,;:!?]*$//' |
+    sed -E '/^https?:\/\/([a-z]+\.)?(youtube\.com|youtu\.be)\//{s/([?&])si=[^&]*&?/\1/; s/[?&]$//;}')
+  if [ -z "$links" ]; then
+    echo "No link found in: $1"
+    return 1
+  fi
+  printf '%s\n' "$links" | while IFS= read -r link; do add "$link"; done
+}
+
+# Stop a download politely: aria2 and yt-dlp keep what they have, and starting the same
+# link again carries on from there.
+pause() {  # pause <id>
+  pid=$(cat "$JOBS/$1.pid" 2>/dev/null)
+  alive "$pid" "$1" || return 0
+  echo "=== paused" >>"$JOBS/$1.log"
+  kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid"
+  for try in 1 2 3 4 5; do
+    alive "$pid" "$1" || return 0
+    sleep 1
+  done
+}
+
+toggle() {  # toggle <id>
+  [ -f "$JOBS/$1.log" ] || { echo "That download is no longer in the list."; return; }
+  load "$1"
+  case $state in
+    running) pause "$1"; rest_unless_busy; echo "Paused: $name" ;;
+    done) echo "Already finished: $name" ;;
+    *) start "$link" "$1"; echo "Resumed: $name" ;;
+  esac
+}
+
+pause_all() {
+  n=0
+  for id in $(ids); do
+    # By state, not by worker: a finished download's worker may still be updating tools.
+    load "$id"
+    [ "$state" = running ] || continue
+    pause "$id"
+    n=$((n + 1))
+  done
+  rest_unless_busy
+  if [ $n = 0 ]; then echo "Nothing is downloading."; else echo "Paused all downloads."; fi
+}
+
+resume_all() {
+  n=0
+  for id in $(ids); do
+    load "$id"
+    [ "$state" = paused ] || continue
+    start "$link" "$id"
+    n=$((n + 1))
+  done
+  echo "Resumed $n download(s)."
+}
+
+clear_finished() {
+  n=0
+  for id in $(ids); do
+    load "$id"
+    case $state in done | failed) rm -f "$JOBS/$id.log" "$JOBS/$id.pid"; n=$((n + 1)) ;; esac
+  done
+  echo "Cleared $n finished download(s). The files are still in Downloads."
+}
+
+# The Shortcut shows these under the downloads. It handles ➕, 📲 and ❌ itself.
+actions() {
+  # An update that brought a new shortcut says where it is, until this line is tapped.
+  [ -s "$SHORTCUTS/.pending" ] &&
+    echo "🆕 New shortcut: $(cat "$SHORTCUTS/.pending"). Open it, tap Replace, then tap here."
+  [ -d "$JOBS/.updating" ] && echo "🔧 Updating yt-dlp and the other tools…"
+  echo "➕ Add link from clipboard"
+  echo "⏸ Pause all"
+  echo "▶️ Resume all"
+  echo "🧹 Clear finished"
+  echo "🔧 Update tools"
+  echo "🔄 Refresh"
+  echo "📲 Open iSH-AOK"
+  echo "❌ Close"
+}
+
+act() {  # act <chosen menu line>
+  case $1 in
+    *' #'[0-9]*)
+      id=${1##*#}
+      case $id in *[!0-9]*) ;; *) toggle "$id" ;; esac ;;
+    *'Pause all') pause_all ;;
+    *'Resume all') resume_all ;;
+    *'Clear finished') clear_finished ;;
+    *'Update tools') update_in_background ;;
+    '🆕'*) rm -f "$SHORTCUTS/.pending"; echo "Done." ;;
+    *) ;;  # Refresh: the Shortcut shows the list again anyway
+  esac
+}
+
+update_in_background() {
+  $(command -v setsid) nohup sh "$0" --update >/dev/null 2>&1 </dev/null &
+  echo "Updating yt-dlp and the other tools in the background."
+}
+
+case $1 in
+  --work) work "$2" ;;
+  --update) keep_awake; update_now; rest_unless_busy ;;
+  -u) update_in_background ;;
+  -v) versions ;;
+  -s) status ;;
+  -m) status; actions ;;
+  -a) act "$(decode "$3")" ;;
+  -b) add_links "$(decode "$2")" ;;
+  -p | -x) pause_all ;;
+  -r) resume_all ;;
+  -c) clear_finished ;;
+  '' | -h | --help) sed -n '2,15p' "$0" ;;
+  *) add_links "$*" ;;
+esac
