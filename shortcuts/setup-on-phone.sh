@@ -171,30 +171,84 @@ fetch_file() {
     --show-console-readout=false --summary-interval=5 "$1"
 }
 
-fetch_video() {  # fetch_video <link> <id>
-  # The JavaScript engine yt-dlp uses to work out YouTube's video links: Node when it's
-  # installed (about 4 times faster than QuickJS in iSH-AOK on an iPhone), else QuickJS.
-  js=
+# The JavaScript engine yt-dlp uses to work out YouTube's video links: Node when it's
+# installed (about 4 times faster than QuickJS in iSH-AOK on an iPhone), else QuickJS.
+js_runtime() {
   if command -v node >/dev/null; then
-    js='--js-runtimes node'
+    echo '--js-runtimes node'
   elif command -v qjs >/dev/null; then
-    js='--js-runtimes quickjs'
+    echo '--js-runtimes quickjs'
   fi
-  # Prefer H.264 in MP4, which the iPhone plays everywhere. Progress is printed in the
-  # same shape as aria2's summaries, so the list reads both the same way. The title and
-  # the final file come from --exec, not --print, which would hide yt-dlp's other output:
-  # the step it's on is what the list shows until the download starts.
+}
+
+# Quick downloads pick their quality by a rule, set in Settings (.logs/.quality).
+# rule_format [<rule>] prints yt-dlp's -f for it, and then "audio" for sound only.
+rule_format() {
+  case ${1:-$(cat "$JOBS/.quality" 2>/dev/null)} in
+    best) echo 'bv*+ba/b' ;;
+    720 | 480)
+      h=${1:-$(cat "$JOBS/.quality")}
+      echo "bv*[vcodec^=avc1][height<=$h]+ba[ext=m4a]/b[ext=mp4][height<=$h]/bv*[height<=$h]+ba/b[height<=$h]/b" ;;
+    audio) echo 'ba[ext=m4a]/ba/b'; echo audio ;;
+    *) echo 'bv*[vcodec^=avc1]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b' ;;  # best for iPhone: H.264, up to 1080p on YouTube
+  esac
+}
+
+rule_label() {  # rule_label [<rule>]
+  case ${1:-$(cat "$JOBS/.quality" 2>/dev/null)} in
+    best) echo "Best quality" ;;
+    720) echo "720p" ;;
+    480) echo "480p" ;;
+    audio) echo "Audio only" ;;
+    *) echo "Best for iPhone" ;;
+  esac
+}
+
+rule_detail() {  # rule_detail [<rule>]
+  case ${1:-$(cat "$JOBS/.quality" 2>/dev/null)} in
+    best) echo "Up to 4K; some may not play in Files" ;;
+    720) echo "H.264 at 720p: smaller files" ;;
+    480) echo "H.264 at 480p: the smallest videos" ;;
+    audio) echo "Just the sound, as M4A" ;;
+    *) echo "H.264 up to 1080p: plays everywhere" ;;
+  esac
+}
+
+fetch_video() {  # fetch_video <link> <id>
+  # The quality: the one picked for this download (.fmt: -f, then "audio" for sound only),
+  # else the quick download rule.
+  fmt=$(sed -n 1p "$JOBS/$2.fmt" 2>/dev/null)
+  sound=$(sed -n 2p "$JOBS/$2.fmt" 2>/dev/null)
+  if [ -z "$fmt" ]; then
+    fmt=$(rule_format | sed -n 1p)
+    sound=$(rule_format | sed -n 2p)
+  fi
+  if [ "$sound" = audio ]; then
+    as='-x --audio-format m4a'  # Opus and the like become AAC, which the iPhone plays
+  else
+    as='--merge-output-format mp4'
+  fi
+  # When the quality was picked from a list, yt-dlp has already found the video once:
+  # downloading from what it found then saves doing it again (a minute on YouTube). Its
+  # links last for hours, but an older one is found again.
+  from=$1
+  info=$JOBS/$2.info.json
+  [ -n "$(find "$JOBS" -maxdepth 1 -name "$2.info.json" -mmin -60 2>/dev/null)" ] || info=
+  # Progress is printed in the same shape as aria2's summaries, so the list reads both the
+  # same way. The title and the final file come from --exec, not --print, which would hide
+  # yt-dlp's other output: the step it's on is what the list shows until the download
+  # starts.
   # A playlist link downloads the playlist into a folder named after it; a video link that
   # happens to come from a playlist (watch?v=…&list=…) downloads just that video.
   # Before each video, its picture is fetched in the background for the menus (see thumb).
   # -v puts yt-dlp's versions and every step it takes in the log, for the debug report
   # (see report); the list leaves its "[debug]" lines out.
-  yt-dlp -v --newline --no-playlist --no-mtime -P "$DEST" -o '%(playlist_title|.).80B/%(title).80B.%(ext)s' \
-    -f 'bv*[vcodec^=avc1]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b' --merge-output-format mp4 $js \
+  set -- -v --newline --no-playlist --no-mtime -P "$DEST" -o '%(playlist_title|.).80B/%(title).80B.%(ext)s' \
+    -f "$fmt" $as $(js_runtime) \
     --exec 'before_dl:echo NAME: %(title)q' --exec 'after_move:echo FILE: %(filepath)q' \
     --exec "before_dl:sh '$0' --thumb $2 %(thumbnail)q >/dev/null 2>&1 &" \
-    --progress-template 'download:[#yt %(progress._downloaded_bytes_str)s/%(progress._total_bytes_str)s(%(progress._percent_str)s) DL:%(progress._speed_str)s ETA:%(progress._eta_str)s]' \
-    "$1"
+    --progress-template 'download:[#yt %(progress._downloaded_bytes_str)s/%(progress._total_bytes_str)s(%(progress._percent_str)s) DL:%(progress._speed_str)s ETA:%(progress._eta_str)s]'
+  if [ -n "$info" ]; then yt-dlp "$@" --load-info-json "$info"; else yt-dlp "$@" "$from"; fi
 }
 
 work() {  # work <id>: the background worker, for as long as the download takes
@@ -232,17 +286,106 @@ work() {  # work <id>: the background worker, for as long as the download takes
 }
 
 # thumb <id> <picture link>: a small square of the video's picture, base64, for the menus.
-thumb() {
+thumb() { thumb_to "$JOBS/$1.thumb" "$2"; }
+
+thumb_to() {  # thumb_to <file> <picture link>
   case $2 in http*) ;; *) return 0 ;; esac
   command -v ffmpeg >/dev/null || return 0
   # YouTube's best picture is large; the 320x180 one is plenty.
   url=$(printf %s "$2" | sed -E 's|^https?://i\.ytimg\.com/vi(_webp)?/([^/]+)/.*|https://i.ytimg.com/vi/\2/mqdefault.jpg|')
-  tmp=$JOBS/$1.thumb.$$
+  tmp=$1.$$
   timeout 60 curl -fsSL -m 50 -o "$tmp.src" "$url" &&
     timeout 60 ffmpeg -nostdin -loglevel error -y -i "$tmp.src" -frames:v 1 -q:v 5 \
       -vf 'scale=96:96:force_original_aspect_ratio=increase,crop=96:96' "$tmp.jpg" &&
-    base64 "$tmp.jpg" | tr -d '\n' >"$tmp" && mv -f "$tmp" "$JOBS/$1.thumb"
+    base64 "$tmp.jpg" | tr -d '\n' >"$tmp" && mv -f "$tmp" "$1"
   rm -f "$tmp" "$tmp.src" "$tmp.jpg"
+}
+
+# ---- Choosing the quality: what "🎚 Choose the quality" finds out, in .logs/.choice/ ----
+# link     what's being chosen for
+# from     share (it came from the share sheet: a notification, then close) or menu
+# rows     the qualities, from formats.py; done or failed once it's known which
+# info     what yt-dlp found (-J), which the download then starts from
+# video    the video picked, while the sound is being picked
+CHOICE=$JOBS/.choice
+FORMATS=${DL_FORMATS:-/usr/local/share/dl/formats.py}
+
+choose() {  # choose <link> <share|menu>: start choosing the quality for a link
+  probe_pid=$(cat "$CHOICE/pid" 2>/dev/null)
+  [ -n "$probe_pid" ] && kill -TERM -"$probe_pid" 2>/dev/null
+  rm -rf "$CHOICE"
+  mkdir -p "$CHOICE"
+  printf '%s\n' "$1" >"$CHOICE/link"
+  echo "$2" >"$CHOICE/from"
+}
+
+probe_start() {  # find the qualities in the background; it can take a minute on YouTube
+  [ -e "$CHOICE/pid" ] && return 0
+  $(command -v setsid) nohup sh "$0" --probe >/dev/null 2>&1 </dev/null &
+  echo $! >"$CHOICE/pid"
+}
+
+probe() {  # dl --probe: what probe_start runs
+  keep_awake
+  link=$(cat "$CHOICE/link")
+  # --flat-playlist: a playlist is listed, not each of its videos found.
+  if yt-dlp -v --no-playlist --flat-playlist $(js_runtime) -J "$link" >"$CHOICE/info.new" 2>"$CHOICE/log" &&
+      python3 "$FORMATS" "$CHOICE/info.new" >"$CHOICE/rows.new" 2>>"$CHOICE/log" &&
+      [ "$(cat "$CHOICE/link" 2>/dev/null)" = "$link" ]; then  # and not replaced meanwhile
+    mv -f "$CHOICE/info.new" "$CHOICE/info"
+    mv -f "$CHOICE/rows.new" "$CHOICE/rows"
+    thumb_to "$CHOICE/thumb" "$(choice_field thumbnail)"
+    : >"$CHOICE/done"
+  elif [ -d "$CHOICE" ]; then
+    : >"$CHOICE/failed"
+  fi
+  rest_unless_busy
+}
+
+probe_wait() {  # probe_wait <seconds>: until the qualities are known, or that long
+  waited=0
+  while [ ! -e "$CHOICE/done" ] && [ ! -e "$CHOICE/failed" ] && [ $waited -lt "$1" ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+}
+
+choice_field() {  # choice_field <title|thumbnail|playlist>: from the rows
+  awk -F '\037' -v k="$1" '$1 == k { print $2; exit }' "$CHOICE/rows" 2>/dev/null
+}
+
+# chosen <format> [audio]: the quality is picked: start the download, and end the choice.
+# Fails after an answer for the Shortcut (from the share sheet: a notification, then close).
+chosen() {
+  link=$(cat "$CHOICE/link")
+  from=$(cat "$CHOICE/from")
+  last=$(ids | head -n 1)
+  new=$((${last:-0} + 1))
+  # If the format picked is gone by the time it's resumed (hours later, say), the best for
+  # iPhone will do.
+  printf '%s/%s\n%s\n' "$1" "$(rule_format iphone)" "$2" >"$JOBS/$new.fmt"
+  # What yt-dlp found goes with it, so it needn't look again; not for a playlist, though,
+  # where it only listed the videos.
+  if [ -e "$CHOICE/done" ] && [ -z "$(choice_field playlist)" ]; then
+    mv -f "$CHOICE/info" "$JOBS/$new.info.json" 2>/dev/null
+  fi
+  mv -f "$CHOICE/thumb" "$JOBS/$new.thumb" 2>/dev/null
+  title=$(choice_field title)
+  start "$link" "$new"
+  rm -rf "$CHOICE"
+  finish "Started: ${title:-$(link_name "$link")}"
+}
+
+# finish <message>: a choice made: from the share sheet, a notification and close; from the
+# menu, the list with the message on it. Fails after an answer for the Shortcut.
+finish() {
+  if [ "$from" = share ]; then
+    echo "@@notify:$1"
+    return 1
+  fi
+  notice "$1"
+  screen=list
+  return 0
 }
 
 segment() { # segment <id>: the log since the download's latest (re)start
@@ -560,12 +703,41 @@ add() {  # add <link>: start it, or resume it if it's already in the list
   echo "Started: $(link_name "$1")"
 }
 
-add_links() {
+links_in() {  # links_in <text>: the links in it, one a line
   # Drop punctuation that ends a sentence rather than the link ("see https://x.com/a.zip.").
   # YouTube's share links carry a "si=" tracking tag that differs on every share; drop it,
   # so sharing the same video twice is the same download.
-  links=$(printf '%s\n' "$1" | grep -oE "$LINK_RE" | sed 's/[.,;:!?]*$//' |
-    sed -E '/^https?:\/\/([a-z]+\.)?(youtube\.com|youtu\.be)\//{s/([?&])si=[^&]*&?/\1/; s/[?&]$//;}')
+  printf '%s\n' "$1" | grep -oE "$LINK_RE" | sed 's/[.,;:!?]*$//' |
+    sed -E '/^https?:\/\/([a-z]+\.)?(youtube\.com|youtu\.be)\//{s/([?&])si=[^&]*&?/\1/; s/[?&]$//;}'
+}
+
+# incoming <text> <share|menu>: links shared to the Shortcut, or pasted in its menu (level
+# 4). One link to a video page asks how to download it: quickly, by the rule in Settings,
+# or in a quality picked from a list. Unless Settings says not to ask; and anything else
+# starts at once. Fails after an answer for the Shortcut.
+incoming() {
+  from=$2
+  link=$(links_in "$1")
+  if [ ! -e "$JOBS/.no-ask" ] && [ -z "$(find "$JOBS" -maxdepth 1 -name .bark-next -mmin -5 2>/dev/null)" ] &&
+      [ -n "$link" ] && [ "$(printf '%s\n' "$link" | wc -l)" = 1 ] && page "$link"; then
+    choose "$link" "$from"
+    screen=choose
+    return 0
+  fi
+  finish "$(add_links "$1")"
+}
+
+page() {  # page <link>: is it a page, which may have a video in it, rather than a file?
+  is_video_site "$1" && return 0
+  case $1 in "$BARK"/* | magnet:* | *ftp:*) return 1 ;; esac
+  end=${1%%[?#]*}
+  end=${end%/}
+  end=${end##*/}
+  case $end in *.htm | *.html | *.php | *.asp | *.aspx) return 0 ;; *.*) return 1 ;; esac
+}
+
+add_links() {
+  links=$(links_in "$1")
   # "3️⃣ Then tap here" on the notifications screen sends the clipboard here, expecting a
   # link from Bark. Anything else on the clipboard then isn't meant to be downloaded.
   if [ -n "$(find "$JOBS" -maxdepth 1 -name .bark-next -mmin -5 2>/dev/null)" ] &&
@@ -739,6 +911,11 @@ act() {  # act <chosen menu line>
 #   @@web:<link>    shows the page in a Safari sheet: the live view, or the player
 #   @@copy:<text>   copies the text
 #   @@share:<text>  shares the text
+# and, from level 4:
+#   @@notify:<text> shows a notification, and closes
+# A shortcut of level 4 also sends what was shared to it as "@@add:<text>", and the link on
+# the clipboard (after @@clipboard) as "@@paste:<text>", instead of running dl -b itself,
+# so that a video can ask how to download it (see incoming).
 # Anything else is a screen of rows: vCards, which Choose from List shows as contacts, each
 # with a picture, a title and a line under it (the "vCard menu" trick, as in Cherri's
 # chooseFromVCard), or plain lines when pictures are off. What comes back is what the row
@@ -767,6 +944,8 @@ ui() {  # ui <what was tapped>
   case $SHORTCUT in [0-9]*-*) LEVEL=${SHORTCUT%%-*} ;; esac
   case $1 in
     @@start) screen=main; opening || return 0 ;;
+    @@add:*) incoming "${1#@@add:}" share || return 0 ;;    # shared to the Shortcut
+    @@paste:*) incoming "${1#@@paste:}" menu || return 0 ;;  # ➕, from the clipboard
     '') ;;
     *) tapped "$(row_key "$1")" || return 0 ;;
   esac
@@ -784,6 +963,10 @@ ui() {  # ui <what was tapped>
     list) list_screen ;;
     item\ *) item_screen "${screen#item }" ;;
     confirm\ *) confirm_screen "${screen#confirm }" ;;
+    choose) choose_screen ;;
+    pick) pick_screen ;;
+    sound) sound_screen ;;
+    quality) quality_screen ;;
     settings) settings_screen ;;
     notifications) notifications_screen ;;
     *) main_screen ;;
@@ -807,7 +990,8 @@ render() {
       n = split("⬅️ back 📥 downloads ⬇️ downloads ➕ add 📂 folder 📦 folder ⚙️ settings 🆕 new " \
         "🔔 bell 🔕 belloff ⬆️ update 🔧 tools 📲 app ⏸ pause ▶️ play ⏹ stop 🔁 retry " \
         "🔄 refresh 🗑 trash ℹ️ info ✅ done ⚠️ failed 🧹 clear 🖼 pictures ⏳ prep0 " \
-        "1️⃣ appstore 2️⃣ copy 3️⃣ paste 📊 live 📤 share 🔗 copy ➖ remove 🐞 bug", w, " ")
+        "1️⃣ appstore 2️⃣ copy 3️⃣ paste 📊 live 📤 share 🔗 copy ➖ remove 🐞 bug " \
+        "🎬 video 🎵 music ⚡ bolt 🎚 sliders 🔇 mute ⚪ unchecked 📃 playlist", w, " ")
       for (i = 1; i < n; i += 2) pic[w[i]] = w[i + 1]
       printf "" > menu
     }
@@ -893,6 +1077,39 @@ tapped() {  # tapped <key>: act on the row tapped. Fails after printing an answe
     copy) load "$id"; copy_text "$link" || return 1 ;;
     share) load "$id"; echo "@@share:$link"; return 1 ;;
     delete) screen="confirm $id" ;;
+    # Choosing how to download a video (see choose)
+    quick) chosen "$(rule_format | sed -n 1p)" "$(rule_format | sed -n 2p)" || return 1 ;;
+    audio-quick) chosen "$(rule_format audio | sed -n 1p)" audio || return 1 ;;
+    rule:*)
+      chosen "$(rule_format "${1#rule:}" | sed -n 1p)" "$(rule_format "${1#rule:}" | sed -n 2p)" || return 1 ;;
+    pick)
+      probe_start
+      probe_wait 80  # the Shortcut waits up to 120 s for this one
+      screen=pick ;;
+    v:*)
+      spec=${1#v:}
+      if [ "${spec##*:}" = 1 ]; then  # it has its own sound
+        chosen "${spec%:*}" || return 1
+      else
+        echo "${spec%:*}" >"$CHOICE/video"
+        screen=sound
+      fi ;;
+    a-only) echo none >"$CHOICE/video"; screen=sound ;;
+    a:*)
+      video=$(cat "$CHOICE/video" 2>/dev/null)
+      case ${1#a:}:$video in
+        none:*) chosen "$video" || return 1 ;;              # no sound
+        *:none) chosen "${1#a:}" audio || return 1 ;;       # sound only
+        *) chosen "$video+${1#a:}" || return 1 ;;
+      esac ;;
+    cancel)
+      from=$(cat "$CHOICE/from" 2>/dev/null)
+      rm -rf "$CHOICE"
+      if [ "$from" = share ]; then echo @@exit; return 1; fi
+      screen=main ;;
+    quality) screen=quality ;;
+    rule-set:*) echo "${1#rule-set:}" >"$JOBS/.quality" ;;
+    ask) flip .no-ask ;;
     delete-yes) notice "$(delete_download "$id")"; screen=list ;;
     report) report_answer || return 1 ;;
     report:*) report_answer "${1#report:}" || return 1 ;;
@@ -1107,6 +1324,84 @@ item_screen() {  # item_screen <id>
   fi
 }
 
+# How to download a video: quickly, by the rule, or in a quality picked from a list.
+choose_screen() {
+  link=$(cat "$CHOICE/link" 2>/dev/null)
+  if [ -z "$link" ]; then  # nothing being chosen any more
+    echo main >"$JOBS/.screen"
+    main_screen
+    return
+  fi
+  row cancel ⬅️ Cancel
+  title=$(choice_field title)
+  pic=
+  [ -s "$CHOICE/thumb" ] && pic=$CHOICE/thumb
+  row self 🎬 "${title:-$(link_name "$link")}" "$(host_of "$link")" "$pic"
+  row quick ⚡ "Quick download" "$(rule_label) · $(rule_detail)"
+  row pick 🎚 "Choose the quality" "Pick the video and the sound"
+  [ "$(cat "$JOBS/.quality" 2>/dev/null)" = audio ] || row audio-quick 🎵 "Audio only" "Just the sound, as M4A"
+}
+
+pick_screen() {  # the qualities yt-dlp found
+  row back:choose ⬅️ Back
+  if [ -e "$CHOICE/failed" ]; then
+    row notice ⚠️ "Couldn't find the qualities" "$(sed -n 's/^ERROR: //p' "$CHOICE/log" | tail -n 1)"
+    row quick ⚡ "Quick download instead" "$(rule_label) · $(rule_detail)"
+    return
+  elif [ ! -e "$CHOICE/done" ]; then
+    row pick ⏳ "Still finding the qualities…" "Tap to wait a little longer"
+    row quick ⚡ "Quick download instead" "$(rule_label) · $(rule_detail)"
+    return
+  fi
+  pic=
+  [ -s "$CHOICE/thumb" ] && pic=$CHOICE/thumb
+  count=$(choice_field playlist)
+  if [ -n "$count" ]; then  # a playlist: one quality for all its videos
+    row self 📃 "$(choice_field title)" "$count videos: pick a quality for all of them" "$pic"
+    for rule in iphone best 720 480 audio; do
+      if [ $rule = audio ]; then e=🎵; else e=🎬; fi
+      row "rule:$rule" $e "$(rule_label $rule)" "$(rule_detail $rule)"
+    done
+    return
+  fi
+  row self 🎬 "$(choice_field title)" "Pick the video's quality" "$pic"
+  awk -F '\037' '$1 == "video"' "$CHOICE/rows" | while IFS=$(printf '\037') read -r kind spec label detail own; do
+    row "v:$spec:$own" 🎬 "$label" "$detail"
+  done
+  grep -q "^audio$(printf '\037')" "$CHOICE/rows" && row a-only 🎵 "Audio only" "Pick the sound next"
+}
+
+sound_screen() {  # the sounds, once a video is picked (or none, for sound only)
+  row back:pick ⬅️ Back
+  video=$(cat "$CHOICE/video" 2>/dev/null)
+  pic=
+  [ -s "$CHOICE/thumb" ] && pic=$CHOICE/thumb
+  if [ "$video" = none ]; then
+    row self 🎵 "$(choice_field title)" "Pick the sound's quality" "$pic"
+  else
+    row self 🎬 "$(choice_field title)" "Pick the sound to go with it" "$pic"
+  fi
+  awk -F '\037' '$1 == "audio"' "$CHOICE/rows" | while IFS=$(printf '\037') read -r kind spec label detail; do
+    row "a:$spec" 🎵 "$label" "$detail"
+  done
+  [ "$video" = none ] || row a:none 🔇 "No sound" "Just the video"
+}
+
+quality_screen() {  # Settings → Quick download: the rule, and whether to ask
+  row back:settings ⬅️ Back
+  current=$(cat "$JOBS/.quality" 2>/dev/null)
+  for rule in iphone best 720 480 audio; do
+    if [ "$rule" = "${current:-iphone}" ]; then e=✅; else e=⚪; fi
+    row "rule-set:$rule" "$e" "$(rule_label $rule)" "$(rule_detail $rule)"
+  done
+  [ "$LEVEL" -ge 4 ] || return 0
+  if [ -e "$JOBS/.no-ask" ]; then
+    row ask 🎚 "Ask when sharing a video · Off" "It downloads at once, by the rule above"
+  else
+    row ask 🎚 "Ask when sharing a video · On" "Quick download, or choose the quality"
+  fi
+}
+
 confirm_screen() {  # confirm_screen <id>: are you sure you want to delete its file?
   load "$1"
   row notice ⚠️ "Delete $name?" "It goes for good, from Files too"
@@ -1142,6 +1437,7 @@ stop_row() {
 
 settings_screen() {
   row back:main ⬅️ Back
+  row quality ⚡ "Quick download" "$(rule_label) · $(rule_detail)"
   if [ -s "$JOBS/.bark" ]; then
     row notifications 🔔 Notifications "On: one when a download finishes"
   else
@@ -1262,9 +1558,12 @@ again() {  # again <id>: prints what it did, as a title line and a detail line
   load "$1"
   title=${playlist:-$name}
   [ "$state" = running ] && pause "$1"
+  fmt=$(cat "$JOBS/$1.fmt" 2>/dev/null)  # the quality picked for it, if one was
   forget "$1"
   last=$(ids | head -n 1)
-  start "$link" $((${last:-0} + 1))
+  new=$((${last:-0} + 1))
+  [ -z "$fmt" ] || printf '%s\n' "$fmt" >"$JOBS/$new.fmt"
+  start "$link" "$new"
   echo "Downloading it again"
   echo "$title"
 }
@@ -1334,7 +1633,7 @@ report() {
       { if (last != "") { print last; last = "" } print; previous = $0 }
       END { if (last != "") print last }' "$JOBS/$rid.log" | tail -n 300
   fi
-  for log in .update.log .app-update.log .web.log; do
+  for log in .update.log .app-update.log .web.log .choice/log; do
     [ -s "$JOBS/$log" ] || continue
     echo
     echo "== $log"
@@ -1473,7 +1772,9 @@ prune() {
   done
 }
 
-forget() { rm -f "$JOBS/$1.log" "$JOBS/$1.pid" "$JOBS/$1.thumb"; }  # forget <id>: drop it from the list
+forget() {  # forget <id>: drop it from the list
+  rm -f "$JOBS/$1.log" "$JOBS/$1.pid" "$JOBS/$1.thumb" "$JOBS/$1.fmt" "$JOBS/$1.info.json"
+}
 
 # Stop a download for good: delete what it left unfinished. A playlist that finished some
 # videos keeps them, moved to Files like any download, and stays on the list as stopped;
@@ -1529,6 +1830,7 @@ case $1 in
   --awake) keep_awake ;;           # while the live view is open
   --rest) rest_unless_busy ;;      # when it closes
   --report) report "$2" ;;         # a debug report (see report)
+  --probe) probe ;;                # the qualities of a video (see choose)
   --update)
     keep_awake
     case $2 in tools | app) update_now "$2" ;; *) update_now tools; update_now app ;; esac
@@ -1584,6 +1886,12 @@ playlist iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAADDklEQVR42u1dMVLDMBD0Q/Q
 live iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAADFUlEQVR42u2dPW7cMBBGdRAdYkvdICdgmzuoyC1yi3SsUgbp0qwBAykCV4sUAYQgSJE0LoJ0jGlQiGxrdyWtljMjPgIEDMven++RwyGHHFaV4rJ7f+NS9YMaztTh3z7+f0WZJXgUrpsg9Nza9VBQ+r/g9UNtH+r+CoKfq/v03nWJwjcTzUmuGj9LU4Lw7ZXMy5pmqkV4QKxqaiwJPwaisSh8rczGrzFG1FbEd8Zb/ane4LSL7zco/IveoNXkdAWIP+wNNSandJOUxA+FV4f4pUFAfEEIiC8IAfEFIRToaupyURF/HgRmuFuZMWP3BccD7L7weIDpETRFKZiCgOvUBq/HkleUYrgIt25taf0WeoGF1v/601348vs+9CX+HH+3iV6gvfW/+vA5HCvxmeleYMHz+fj911EA8Zlpj8iC3//zz9+jAOIzs/OCNOtV/wXOFSMDcm3W9dwIgHYMwB4A+bbGjwEIAMhXzS45bwXAk6VqS6ueGwLgTS49bAhAZ87+bwxAMBlyvBRAXK549/XH46z57d036eULVxSAN7eH0dmzIARnLuy4FMCpRTzBJQxfDICx1j8sQsvZAOhLfC4FIABADEAAAAAAICZm/NJ9bDd6ItEvB0BG8ZeEFQGQwZSccgkBcMXWP0UMAABgdQAeALITMQAAoGwADgBiABwApAFIhCQB8GxrSu6gPABeBuU9AA75B2CpjVkAGDlDDICDjP2X2JwLgPHNuS0AZLen1wAQPKCR0xu6RIylR5QUAfAqDuktDcgsPaQXX1PJntJGxTHVuD9zSUjykmOqx+DFz6LmsHbOwTgG4ZcIcclB7efgp2wEyJ6ugFQFwgk7SNYhnKyDXqAgiR8Jm4QTNpGyTEH2RJL2CSftI22lcNpKTJGQ6cErEvB6GA8U2X3GAwV2HwgKxQeCAvGBoEB8ICgQn4vcFN0tueMqQy7zNDvDxSQZNDlc6GznZm2uNFcCojUGopsdwwUEws81TV6ZjW+q0koarNudTN7qfXrvuqI8cWH9lcxUl17bofQ8ID0UP9FsDf/WaRf8H44SRP374cRfAAAAAElFTkSuQmCC
 share iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAADJElEQVR42u2dzXGDMBCFObsGrumBY5rglCp0SQVpIGkgd824gRTAuIIUgCtIBcSbwFi2ZUBGsLvS08xePBiY96HV6m9VFILL7q2re7OOdRPmXvv3/wIlSHASrp0hdKi1AxQofRa8PJk5WbOC4FPW9M8ucxS+mulOtjJ6lyoH4c1K7iWmmzIQHiCiuhpNwvtAVBqFL4X5+BhtRKlF/Fr5Vz9WG2rp4tsEhb+pDVJdTpuB+G5tKOFycndJvfhd5lZD/NwgQHxGCBCfEQLEZ4SQYagpK0SF+GEQ0MNNpccMv8/YHsDvM7cHcD2MrqifTIGAcaxC1KMpKurncCFcXDPJff37739LqhZo+fpJ+KEogmCS+Ppd8ZVBaNVHPj7xlUGo1Mb9Y+IrgmDHer2qxVcEoVTV+IaIrwSC8QFoUhFfAYTGByAp8aVDED/k/LI/d7SubUxsn9G9RA9Vaxv1vFfUjpJqG3hLBEAr2v9nAKBTO+WYCoC/dgAA+AFYAGBsiLkBPL133cfhfgg52PPnfAB07dT96Jn07KwBUHw+t7ix/BSAR+/LBYDtBY4//ADoHVgjIQ1f/5oAuGsBAADApTuY0zA+GgXRvX1uDwACRy6XhKG+wTwAAAAAAICMAVgAyLAnDAAAIAZADQAZzgcsAXA43v6XflMJgGtKcgkAGm6+Lu5wtRYArJPySwC48wih4/qCALSsy1KWAoi52IsJgGVdmAUAV3uIAYBxaSLH4tzMATTsy9MzB2DYN2j4AMyN5ZeYrw/BAKBk36J0b9qQBJpaUvKo+cRnAGBFbNILnbdds2wMoBKzTVVKEbVZe8vGmHqx3IXeQVy6gi1rwetX2AKtWIWeSc8WmbADyTqYk3UgXY2AJH5I2MScsAkpywRkT0TSPuakfUhbGXnIGdkTlbgeREUMUQ/aA0F+H+2BAL8PCALFBwQB4gOCAPEBQYD4OMhN0NmSOxxliMM81fZw4ZIUuhwc6KznZG0caS4EhFEGog2ewwUICB/qmqwwH18VuZW+sTY7nrzVTf/sskC5CGHtSm6q7e9dQ+kwIAMUO9NtudfW0gX/BbMdgVv1FFroAAAAAElFTkSuQmCC
 remove iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAACcUlEQVR42u2dTW6DMBCFOYgPwkV8EC7CprtsuoxE78Edou6Qou7TA9C4clSqRgmo4DfGn6XZkWC9h9/M+GdcVYZb2774aN3Exic2ffb79xVtEeABuGEG0EttuJEC0j+Au6s1V+s3APyZ9fHdrkTg65lykspCX+oSgG82kpc1ZaoBeIhYVWpyAv4eEXWOwDtjGr+Gj3C5gO8z/+ofjQZvHfxuh8D/GQ1WJWcoAPzpaHBITumSFMEfCzcP+KWRAPhCEgBfSALgC0koMNS0FaIC/jISyHD3kjGj+0J/gO6L/QHSI5SiuJgCgOtYTdSTU1QU13ABbl1r+PpzGAV8/eJRwNcvHAVEPuKIiLhfmBfErBeA0pjD+VpzxqIt4qVaf48AgEloTDlbmqom+hFHQyRf4qQMMIR+AP0X+wEI0BOAA1Y6YgiAgOIJSPrSw+F1PJ3ex8vlc7TSQl9Cn0LfkkdCKV92PL6N1lvo424JOJ8/zBMQ+rhbAnJpEAABSBBOGCdMGJqKABIxMmEIAAwhAUxHsx5Q+MI8QIi3prAor1+UxxGLt6XgB9RniAFEuDWRzbk2NueyPV28PZ0DGsoDGkRDBkoXcEjPQNkCkjLxYW2csYFyBYwCccEORoG4WAejQFyuhogoceRD6QJR3E/Rvu2lp/1vEVemqleccqZ6YibSQ1QkiHrwB4Z0H39gQPchwSD4kGAAfEgwAD4kGACfi9wM3S3ZcpUhl3lmm+EiSRlKDhc653OzNleaGyGiyYyIYfEaLkQA/FJp6oxpfF2V1qKzbkRb4/v4blfRfoWw3UYyNcT/9iC9jJAbKd1M2Zo+660D/gXJFS+bv20XhgAAAABJRU5ErkJggg==
+video iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAACs0lEQVR42u2dPU7EMBCFc5AcJBdJwxlocgHuwBno3FPTRTR0VNClo0OAQCCksFl5IcBqN4bEb7z+LE232UTvjd+M/8ZFYbhdHD3U3tzI+j02/u36+YIWBPgAXDcB6FDrNqSA9Bfg5cqalbULAL7PWv/uMkfgq4lyEsuGb6lyAL5ZSF7mlKkG4CFiVqlJCfhtRFQpAl8a0/g5YkSZCvh14l6/qzfU1sF3Bwj8r95gVXK6DMAf94YSycldkjz4feZWA35uJAC+kATAF5IA+EISMkw1baWogB9GAiPcQxkxo/vCeIDui+MB0iOUIr+YAoDzWEXWk1JW5NdwAW5ea/D+FHoB3i/uBXi/sBeQ+YgzIvJ+4bjAj3oBKI6VBF9rwVi0RTxXa7cRADARTTLlfHXy1F+fPi9q7fFjelPVMbKfu8u3PlYbiPjPt0Yi0UUbfHXnr33sNvS2v3zr7dnL+vmog7KlX6ZoQ48L9fr7m/fP56PFgRj6b52AjdePW7Q4kDMBP71eRYDLkYBtXi8gwGVHwC6vh4CFCdjn9SoC+kMnYKrXCwjoD56AEK+HgBnb4PGhXg8BhhoEQAASBAEEYdLQGAQwEGMkzFQEk3FCApiOFk9HsyCjXJBhSVK8JMmivI1FebaliLelsDFLfYaY7YLCrYlszrWxOZft6eLt6RzQUB7Q4IiSgdIFHNIzULaAY6riw9oEYwPlCugF4oId9AJxsQ56gYEifmRE4oJNjAsMVE+kaJ+BIq6UrRSWrUSKDBRuJSuKlPUQDwzpPvHAgO5DgkHwIcEA+JBgAHxIMAA+F7kZulvygqsMucwz2REukpSg5HChczo3a3OluREimsSI6ILXcCEC4EOlyRnT+KrIrflg3Yi2xrf+3WVB+5bCuoVkqvP/XYN0GCEbUtxE2Rr/trYO+AeH0z7N8gAIDAAAAABJRU5ErkJggg==
+music iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAADGElEQVR42u2dPW7cMBCFdRDeI7qES9UpfAGrdJsLpMkZXPACaVwLcOvWnSo3OcPEE0iIbNNaCpJ23pCPwDTG2l68j3wc/jcNcJFv37sp4iLkQiw/++/3G5ZNgqtwY4bQW2OcoVDp/4KHt+jfYjhB8EsxTP871Ch8m2kn1wr9Lm0Nwvcn2cuRNtVTeII41Go8CZ8C0XoUPoB5/BF9RPAifue81q+1hg5d/Fig8J9aA6rljBWIv2wNgZZTuyVN4kvl0VH82iBQfEMIFN8QAsU3hFBhqomVolL8bRA4wi1lxEzfN+wP6PvG/QGtx9CKpsUUCnhMtMx6PGVF0xouhTs2+rJq/+sfkYffIve/ymoFbmr/sjy/iPx8ELm5898K3Hj/V0Vh4LaKsZzMJ6eoRd3+8JMRucr7t5S5v8CwqLg26pUiAaT6C9vvH/ynnkeUxyerVtGnAAzVAdBi02EPKQBCANcL/1POzgG8m6p2Oev5sejPNOXUbEezHnwA0ffEWwrAMnJh2AEY/fp/DoBlaKajqaemoDgAxPeS4xYAazBspy26+gCkgBgDiFUDsJ6WIAACqB6AEIBdEAABEAABEAABEAABEAABGAHAHojpXE1qwowj4RND5/J1wTy1vWTe0UAAJ4UuouTs8ykIAM50dKrW5xavR5hgAKjt7Cmez5BBfJnUcmHhAHAW5TXT2Vs8n5ox74g1zawPQMTZmFUngA5na+JeAJqWevV/iM25e/oA7bzxjyZlbc7tXWZBfg7pXdyeHtyNAxSaz/w/YB5RypmGWPq+P+tZv7oA4pCeTraVK/7lawsgdkqruKl5IYzzXece1uY1BVfufHlRB1DtZysAqP1sBca1nxc2GWQ+vLLMKO/npX3nW4/svcRVeG3lcVPOvD3RifUwKzLIetgfAPk++wMA3ycEQPEJAUB8QgAQnxAAxOdDbkBvSwqfMuRjnm5HuLQkh5bDB539vKzNJ81BQPTOQIyb13AJgsJvtaYI5vFtU1uZOuveaGv8MP3v0LC8S2HjSTY1Tn+7o9LbgMxQYqZtLT/boQv+F+M59RAJ7uEbAAAAAElFTkSuQmCC
+unchecked iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAADfklEQVR42u1dUWrcMBD1QXwQX0QH8bV8kP0PhJJCSqhTSAglhe1HP91MsOk2WWTJq5l5Wj/DfMVrO+9JTzPSaNQ0wNfx+CfMNpzYtGKn977/vuGVBbgANyYAnWvjQgqR/gd4+2b9mx0UAF+zw/zudo/Ad4lyYmXyLd0egO+V5KWkTPUEnkQUlZqagD9HRFcj8C2YxpcYI9pawA+Vt/pYbwjo4A9XCPyn3oAqOeMOwD/tDS0lZ++SNIM/7dwCwd8bCQTfkQSC70gCwXckYYeuJpaLSvDzSLi6CPfp6ee73d9/j9py39VEzF66//Lya3p4+DHd3X2bbm6+bDL5rTxDnlXleOCh+4+PzxeBHiNDnl3VeGApPQLO7e3X4sB/NHmHMRHDVvA7K6mxAP4cEYbS1EF6PTJoWgP/0eQb4LyieQ1X7YNeX3+7tPpYb5BvUiahh2j9WyRH7l9czJhsyN8WV3XLO5QlaXRv/QJODiiXupCLK5vzTuUYondr/QJGDvAlJUGelUOEYk8YXTyfVM0XX11Ti+XZKTGG8pjQmfv9KeBLC7XyzVN6g3yzaVwwR70urqbH3E3KeKToorYmg2+K7ntOnKWQoDQe9OcIOFhLD8Ks5RoJSlJ0OEdA8bkdFM2/dEzQmDtSn3KOtX7xRNAWUWLekVIvCGrez1rrNwj7N7moxr1gUAu+Yq0JSXpypEih144q+r/m+SC2/tReUNojUtH/WCtCbv1O3x+KExCTH8e12SI9WEGGQvEB2CG0N506KT4QlyQgFtQYrTypT58UDh7tCADJ1UH7P4bGquXUoP8p40DpnmxGQG3phSSABJAAEkACSAAJIAF0Q7UJYCDmHIhxKuJapiI4GbeNAE5HO09Hc0HGc0GGS5LOS5JclMdYlGdainNaChOzPBOzmJronJrI5FyM5Fympzunp3ODhucGDW5Rct6ixE16AJv0uE3VeZsqN2oDbNRmqQKAgh0s1uFcrIPlagCK+LFgk3PBJpYsA6ieyKJ9AEVcWbYSoIwxC7c6Fm5l6WKA0sUs3g1QvJvl6411nyQAgk8SAMAnCQDgkwQA8HmQG9DZkkceZcjDPKuNcClJFUoOD3Su52RtHmkOQkRfGRFj9houiSDwudI0gGl81+ztmgfrXiM1PiVFfH532/D6z4UdlGRqnJ8diHQeIQspQ6Jsnd4b0AH/C1WIlGUB4PROAAAAAElFTkSuQmCC
+bolt iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAADSUlEQVR42u2dPW7cMBCFVecMbHMHlbmEqpxCjQ+SC6QOgXTp0y2SPr0BuXKfnjENCZGt/7XWnI98A7Dy2ta+R72Z4QzJqjJs4euHph9+NMLGGH/2+fcr2SHAI3DdDqCPjm4gRUj/B9w9jfZpXG4A+Na49P/blQh8vVNO3mvEZ6lLAL69kbycKVOtgBcRp0oNCfg5Imoi8M6Yxp/hIxwF/AY+69fehsY6+D5D4Cdvg1XJ6QoAf/w2OElO6ZLUgx8KH43AL40EgZ+QBIGfkASBn5CEAkNNWyGqwD9GgjLcXDJm6X5CfyDdT+wPJD0JpagvpgjAc0ZdTtTz4xM/KupruEzw/3yx+nxt/rP/70MIPz+zcwPs7L//Hp7t20fLz9nmOfvjrB+MnCEjI58446P0RItvATkiQsb9g/REs+uAt/OCPuvlSk80uw749XB85zuWnsFs5gD7nHGiFvHrx+OvMDHO81/mCOB8gd93U/AjIaDvwF1yjtIzZ4wIaH6pGhX9zEkPywFPoyFM8hXDzCXjOOBpUoZZaFsz4PIJS/9fh5xjiz+jliwRBKxJD9MBvyDAo6UnWgxLqeVK0wTMZbt5REAQAsYLbZk54DEBjIW2s81I4aZCS8+1ZshnVGjpucaMrRnZI2BuoS1D6bFJwNJCW4bSY5OApYW2M8xoslYVIT3RoRttV6mKkB7DiRq7AxosPYxM+K2JmmHp4ROwx2fYL9J47hakrWSN0aTVcAnIo0DT8FpS9jhgSH2Y2xG9VqRhSM+kKO+ziIBYzVmeuxd4yQHbDjnX9xDj+0JhdWF2cy68L3SpObdFOmD72e7u9nSHdMDMjgjH3aI0btJiNmR59ia9IQJiSs/2sQXmkzK29HTsjdpD4YbbC9qyjyqIs57bCd3xD+uIDpi3EeP4YR1m3wIu+J0ObKId2KQjy94h7tehfbeXnvDWQ1yDjq08b8lZpydCpEdHFyeIeuQPDOm+/IEB3RcJBsEXCQbAFwkGwBcJBsDXRW6G7pYMuspQl3liM1xJElBydKEz52ZtXWluhIgWRkR3uIYrIgT8UWnyxjS+rkqz3lm3iVrjL/3/dpXsRQjrbyRTXf+3GyF9jJCBFL9TtsafbawD/g8YnsTy2t7CbgAAAABJRU5ErkJggg==
+sliders iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAADkElEQVR42u2dX6rUMBTGu5AupBvpm9wlKN2BbkG3oC9ZgO5g0C3oWx9E8A+IIAhCvOfSYmemk5xc0pxzki8QuMxtp8P3a76c/Olp1ykud08+j0t1m+ojdXvsw/kdSpLgJNzMEDq1zisUKP1f8P6+Tvf1dIDgsXpart23KPzAtJNSlX7L0ILw00H2ktOmJggPEFmtxpLweyAGi8L3yjw+Rx/RWxF/NH7Xh1rDqF18V6HwV61Bq+XMDYi/bQ09LKd1S1rE943XEeK3BgHiC0KA+IIQIL4ghAZDTV0hKsRPg4ARbi0jZvi+YH8A3xfuD2A9gla0LKZAwDx1QNRjKSpa1nAhXN46qb37P7z/7al8//bXP3v6hXXOq5c//Frob8459N10DSp0TZWtoPTdvxUyRcxVyBXckdcq2gpK3/2PFeWyGAEwq4t8GgMQjogk4v4GAbjQqNcDQJHaqwk9GwUw7QE4AUC5rfF7ALwFAC+ef/WfPv65AkCf0f+MAPBqppxTRLk8dq+knC8J4GyqWnLWkyvKdhQbKqHRtDIATsXEG1eUN69/em6hYw0AmMX9P0WUdb6IU27N8ygD4FUsObYM4KEfAAB5AM4CAE4ElPodCgA4MwCo7sX/e+MBI2GoPQCxUDS2oKMVgLcCYIXw7u2vK/Hps9hqmkIA3hyAx84FEZzLjpwDDQAyAAh14GRbonNCtQOgCTpOkWoJ1QPgRE5CuyTqB0B3dUppDsDe3D5nXp8LIGXwRoVz3WoAxMShCKU0AIl+QGQgxu0YQ3ZUiQXJjIS5HWNox1vuTjjW4qoCkMOXuQA4K2kpe1KPADBq8n6uDaXYB4l7qyXQ54Kj4fLrAam+nAPAWi/nkG4tXRZfmC99Yc7iekxY4/uCzremlF6U5y6whzrGCgDMottSYkuMsT3/FQBw4huz9ub1udPEFQAYTW5NrAUANucq3JyL7enC29PxgIbkAxp4RElB6gI8pKcgbQEeUxV+WBsPaitIV4BUBcIJO5CsQzhZB9LVKEjih4RNwgmbkLJMQfZEJO0TTtqHtJXCaSthRULWg6hIIOpBf6DI99EfKPB9QFAoPiAoEB8QFIgPCArEx4vcFL1b8g6vMsTLPM2OcGFJBi0HL3S282ZtvNJcCYjJGIg5eQ0XICB8qjU5ZR4/dK2VpbOehLbGn5Zr9x3KWQjrDrKpefnuEUqnAVmhOKZtbY8dtQv+D87MdQOcLzMeAAAAAElFTkSuQmCC
+mute iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAADDklEQVR42u2dPW7CQBCFfRAfxBfxQXwRmnQ0KZGcMkXaSJGokFKjdJZQenIAJxstiiELXidmZ4b9RprOgHlv983s32xRKLbF4q723g68H/Hhs9+fL7BJgDvgugigp3p3IAWkfwAvv7z58vUVAB/ztf/tMkfgq0g5SeXuXaocgG+uJC9zylQD8BAxq9RYAj5ERGUR+FKZxs8RI0or4NfGW/2l3lBrB7+9QeB/9QatktNlAP6wN5RITu6S5MHvM/ca8HMjAfAFSQB8QRIAX5CEDFNNXSkq4E8jgRHurYyY0X3BeIDuC8cDpEdQivxiCgDO4xVZj6WsyK/hAty83tD6LfQCWr9wL7Dc+pfLe9u9wHLm48Df7z9sZ0RW8/7Hx6f+YGbHBX7Uaw785+eXfmhG3ru8ieC73b71p2Y2GAttEf+X3ofMyH9Yhwgwo/fnwDdEQG9yynkYbK0TcDRVbSH7Cem9cQJaE4Mvp/e73XsfayanJrS+5Gr1cFHvYwhw3+F6j5Ov2LR2s3lNMqpWrf8xej9GgANxaGMkDGUu0ai6VkmAa4F/tTESz7Xs0LOpCGhTtmrXyi75FL2PkaBTCQu17NOe4sy9S5JAnJKAFPYXcGNIgoB/ZEEheTnEg1B6m3Bau02aAUkRcA7o04m8mEA9eyaUCwEhqRHS/XwJCMUDAd3Pl4BL4wup5UwIgAAkiCBMEM47DWUgJjwQYyoil6kIJuPCBDAdLTwdzYKM5IIMS5LCS5IsyutYlGdbivC2FDZmSZ8hZmui4NZENufq2JzL9nTh7ekc0JA8oMERJQWlCzikp6BsAcdUhQ9rc1BbQbkCShUIF+ygFwgX66AXKCjiR8Em4YJNlCxTUD1xQdE+2aJ9lK2cecqZ6olGpIesSCDrIR4o0n3igQLdhwSF4EOCAvAhQQH4kKAAfC5yU3S35IKrDLnM0+wIF0kyKDlc6GznZm2uNFdCRGOMiG7yGi5EAPxUaWqVaXxV5GY+WDdCW+PX/rfLAjtKYdsryVTnv7sG6WmEHEhpI2Vr+GytHfBP4FYHVdWSEFAAAAAASUVORK5CYII=
 bug iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAAEbklEQVR42u1dvY7UMBDeB8ljXJFnoE9BSU2ViopXQDwDonJPRb9XUSAqaJBSIIqrqOiWm1Oi9YacPbaT8TfJWLLEHVkn9332N39e53QCbnf3L7uxO69fIt2/9unzJ2tJgBNwAwPo1D5MpBjSV8Cbx94/9vMGgMf6ebx3c0TgW6acSHV6lvYIwPcbycuaMtUb8EbEqlKjCfglIlqNwDdgGr+GjWi0gN8pn/Wh1dChg+92CPx/qwFVcoYDgO+vhsYk5+iSNIJ/OXjvDPyjkWDgVyTBwK9IgoFfkYQDuppYLqqBn0aCRbh7iZhN9yvaA9P9yvaglvS8+f7+8vnh/vLq29visWgMGovGVCVFYzFF/IEJML+VkLDmWIW9VeP1zEH7/ffh8uLL6+Rx6DP0WRAChlTw+5ra+fHXpyISlsCnMSvbg16Vz0+67Tf6WeKz1VdB7dnv969/fiQDOQefxgDyinpVEe+SlLz7+eHGXvi6Tv+3hv2otgpqeT6pJMxXxtLvAMGPe0SoKQfy4VNbRb8/Ly4Yo17YqHK+CkKNrgWPkBto4xtzSzkNwO1MM8aVtoizbEBuA7UBT1vjlwiAfNi5Z5PSfI8JratJOc/9+pQGEoDFU9XIBZcdE+BUlBt3TMAAr/+5MYCCWOBqB9BLjjv1gq52QEPNd4dxwA0BTmIWkx4TKLlFkaX8z3MtNwNKz0bPSM8qtHqcCAFLybRUH31eKQu1VJLpWZaSebshIJSzoRkXmm3T6snxgGLj0r1DOSYpAiCiWZqB85m7lIqeG9mQkV5KSdM9OHImFUWfJL2Z2IybQKM/noAKXev7+KEVQmPQWDQm596xFamWgJjmlgRZJcFark1STcDc66hFQIlXtgsCfHniSMQaBEwShxKkwaUhuO5mDgG1Z7sKAri5nxwCEHNDRgAAAVC1AC6YOQQApqedGAGkvzQDY53rnuYQQGNznkHQVsgQUOqnbx0HVFwtTiQdvUXbmgChXJBMPSDFv0chQCgb2omUJKc8EAEV61yycgigsTnPIJUPgizKH8gLGiC3pXA3YuUQALZRy0FuzDpQINZBbk3k7oLIIQBplwTc5lxuwabUCEsXXFI25/a1sp+5Nd8SN3StL4KvuT29kTa2JfHBWnHAVB+o/gUNCW+IWwGjnE3suhQCaCxOjkmoQubEv6TH3Ykwl4WQR8QlwPd8uHK3tEND7NiCLYKykNTESoTPkcAh4Dm3k1MC3SgVMVT5onYoNZyytZFLQMrWwlAKvNpxBWuvAn8Wl7iBk6tKgPkzlP492Y3SsTcM2gY1h3XstPd2SJ+mQ/wQjy1Q3Fs7LVHj6Yl2aB/AIa52bCXAMcYmRRUPbjWvCODoYrMHwrpv9gBA940EQPCNBADwjQQA8I0EAPDtRW5A75a8s1cZ2ss81Ua4JkkKJcde6Kznzdr2SnMQInplRAzJNVwjwoBPlSYHpvHt6WhtNNZ9pa3x5/HezcnajQvrNpKpYRy7M6TTCJlIcUzZ8q/t0AH/B5af1rMA+0zeAAAAAElFTkSuQmCC
 ring0 iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAAEeUlEQVR42u1dzW7UQAzeM8+QGy+RF8mD5B14AB6CU86cOebGoVJVbaWiihRUVKEilUOLkAj1KoFlye7YM/aMveuVLKGy2STf5/ns+fOsVoo/Dw+PzWTdlo0B2/7u5vqVf0iAA3ADAmiqDTMpjvRfwKtna5+tFwA8ZP107+oUga+RcpLL4FnqUwC+FZIXTplqHXgnglVqLAG/RERtEfhKSuPv7r6Nt7dfFw3+TzBGVFbAbzi8fgb66urjuF5/GM/OLkgG18C1jMQM6lPYVK+fAaeCjbWZkNTWoFVyhlhPv77+JAb6PoN7JrSMQY0kxUoOvHyMtHAbPEMkEeUlaQLfJPCMRDQmwL+//64S+CUi4FlVk0AF/+bmi3rgdw2eWSUJFPCteD1ja2jUgA/p3vn5pVnwZ4N3IKauTfFUEx7YOvC7RiBBJkXFgi+l99CJmjtSh2z+XuG4MBTp4XK+OOgvvHDKMAJcC7/BGYfgHbP2mLG6z+X50EONSANRCQFXj5vQEposup+q+RDoItK+aIN7pSYIyJiQFg8w0pMKvpTH52gRSBK6WPBrzEvEehJcJzh+T4oTKe+AdJ5aJOuJDW4QyEp4/SFHik0gAAP2rGiawxUJutDstU5BxkoSMn61bN4PHiPcmSlmsTEN0aIHNu+PkR4L4KeQgJSiNtn7IWgdk+xwyhEiqRiSMx+q9xN6juqMGpiRraCOzvup3k9I06Ls3eXTxiSzI2qKimgF3aFeL6v3S+X568+P48vXv8YXr8aNwb/hb1L9BIFWUJGDL/VBJHW/ffvzD/izwd+0xAOE47VLBPRcDyEtPbvgz6ZFihDO1y8RcPAi4flU1QTEdDxDv0cacqbmxdLZSQkCqE6I6Pc06OyHko7lyPlLEUCRYUT63aE7X8xdcrMEUIdg0J0yruwHmYKZJYCaioeyIXb9zzWrVZIASjBGxYEQART9zzXBUpIAiiIg4kATDMCUJpdrjKYkAZSYiJDkLkiAxkG30gRQVMEJMEAAi97lnHApTQAlMQlmQlw3cgLicHECnAAnwAlwApwAJ0AjAZ6G5klD1XbEYMXDm/c//rN9BCx9V2LVxMn0hHdXP1BNarVEVgJKD8bFkiC5VIV7ME79cDSVBC3rhLDD0SYmZLAkSIIvMiFjaUoyRII0+CJTktYm5feRkAN8yUl5U8tScq4NzbUsxdTCrG0ScoEvujDL2tLEbRJygS+6NNHa4twSuyhzLM41szxd+3al2OXpZjZo5N7InWWDhsUtStqkJ2mLkm/SU7BJz7epFt6m6hu1FWzU9lIFhUsVeLEOBcU6vFxN4XI1XrBJQcEmL1lWuGSZF+1TULTPy1YWLlvphVsVFG710sUKShd78W4Fxbu9fL3BMwT8AAc/wuT4jjDxQ3wMn6Tkx1j5QW7HdZCbH2Xoh3n6YZ5+nK0f6OwHOgcmdfxIcwVEtMaIGMhzuE6EA0+Vpk4R8N1RSE1ksG5DS+OFrJ/uXa38808K2wnJ1DD9duNI0wiZSemQsrX93UY74L8B6eii+J9r78gAAAAASUVORK5CYII=
 prep0 iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAAEU0lEQVR42u1dzWoUQRDes88wRx9iTr7FHHyMwQfyGubm1aPC3gMhRFhZ7AgJQSIkoijKmFpmMG7mp6q7ert69lsojLs9f19Vf1U13V29Whn+3N39qDppHkk7I4/b7o5f4SMCnIBzDKCl4nqlAOl/gBcPUj/IOgLgc7Lurl0cI/Alk04OJXQv5TEAX0eiF02aqgE8FKFKNTkBP6SIMkfgi1gcf3Pztb26+jIo9FtEH1HkAn6lYfU90JvNp/bi4mN7enouEjqGjlVUjDMfwoZafQ+4FGyu9AoJ7Q1WKcf5Wvp2+zka6GNC1wzoGc4MJflSDj28D7VoC92DpyLSU1IHfpbAKyqiygL829t7k8APKYLu1bQSpOBfXl6bB35f6J5NKkECfi5Wr9gbKjPgU7h3dvYhW/B7oWcQhq5V8lCTbjh34PdFoIQ4ISoX/Fh8T0lUn0hNSd8usV9wSTJczQcn/qUHDnmNQMfSOTT9ED3jQTNmLu9rWT5lqB5hICsg0Mq4BT2hOgjvh3I+OTqPsM9b6FqhAQLTJ4T5Aw71hIIfy+IP0SOYSmh8wS85D+FrSXRcxPf3Ij8R8gxM4ymjRD2+zo0cWQqrnzIk3wCCMFCPirox3ChOl7q91SFIX0pi+q9azfrJYiInM8nE16cxerRTs34f6skB/BAlMKmoDrZ+clpLoh1NOmIEFS448pFavyBzNCdSx8zsBaV33C+1fkGYZlJ8wmxGL2imsl5V67cQ52vkCRF6QSF2vtIbyZH3tfwBw/DqIQWstW4id+oJpSKG8a2HFDB5UOTxVPMiTTznzid65SyNi5cGvo8RMvKeih39SMKxJXF/CA0zwu+GnXwpp+RZ+wJFJnAs/pdEP8wQLGuRhOJz0ZA6/y/R+YY4Y5YfmFOAhP+XkHhpJmYMP1DNOmBJl1s6+FKfyKDkZlYBx/DSLeZLOiggAwWo8F3ogMu37bv219uX7e83L3b/0v/H2t5fb9qf71/t2pLQ3/Sdxrm1B2xmIyGtC4Uo4Pv5Sdu+fvZE6Psh8P+cPH/Slr4bUoLk3DEUMIdLcgUQaEMA9bLfnqx9rC39tt9+6txTveZoFDBmoWOWSjQy1pZ+Czk3FAAFgIKOTgFwwghDk4ehSMSQCUMBeBmX8GUcXkcnfh2NAZmUAzIYkkw8JIlBeRuD8piWknhaCiZmpZyYhamJiacmYnKujcm5mJ6eeHo6FmikXKCBJUqJlyhhkZ6BRXpYppp4mSoWahtYqI1SBYlLFaBYh4FiHShXk7hcDQo2GSjYhJJliUuWoWifgaJ9KFuZuGwlCrcaKNyK0sUGShejeLeB4t0oX5/hHgLYwAFbmCxvCxNs4pPxTkrYxgobuS1rIzdsZYjNPLGZJ7azxYbO2NB5ZlAHW5obUESdmSKceAwXigDwUmpqDAHfLIJqPJ11PTc1PpKsu2sXK3z+C2GbSDTlunNXQFqmkF4pDZO2HretrAP+F1XXCF/AXGcuAAAAAElFTkSuQmCC
@@ -2136,29 +2444,135 @@ if __name__ == "__main__":
 WEB_PY
 mv -f /usr/local/share/dl/web.py.new /usr/local/share/dl/web.py
 pkill -f /usr/local/share/dl/web.py
+# What turns yt-dlp's list of a video's qualities into dl's menu (Choose the quality).
+cat >/usr/local/share/dl/formats.py.new <<'FORMATS_PY'
+#!/usr/bin/env python3
+"""The qualities a video comes in, for "Choose the quality" in dl's menu.
+
+    python3 formats.py <what yt-dlp -J printed>
+
+prints one row per line, its fields joined by \\x1f, for dl to show:
+    title     <the video's or playlist's title>
+    thumbnail <its picture's link>
+    playlist  <how many videos>                  (a playlist: no qualities to pick from)
+    video     <format> <label> <detail> <1 if it has its own sound, else 0>
+    audio     <format> <label> <detail>
+Videos come one per resolution, best first: H.264 where the site has it, since the iPhone
+plays it everywhere, and otherwise the best of the rest. Sounds come best first.
+"""
+import json
+import sys
+
+SEP = "\x1f"
+
+
+def codec(name):
+    name = (name or "").lower()
+    for prefix, label in (("avc", "H.264"), ("h264", "H.264"), ("vp09", "VP9"), ("vp9", "VP9"), ("av01", "AV1"),
+                          ("hev", "HEVC"), ("hvc", "HEVC"), ("mp4a", "AAC"), ("aac", "AAC"), ("opus", "Opus"),
+                          ("vorbis", "Vorbis"), ("mp3", "MP3"), ("ec-3", "Dolby"), ("ac-3", "Dolby"), ("flac", "FLAC")):
+        if name.startswith(prefix):
+            return label
+    return name.split(".")[0].upper() if name not in ("", "none") else ""
+
+
+def size(f):
+    n = f.get("filesize") or f.get("filesize_approx")
+    if not n:
+        return ""
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1000 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit in ("B", "KB") or n >= 100 else f"{n:.1f} {unit}"
+        n /= 1024
+    return ""
+
+
+def has(value):
+    # Sites that don't say what codec a format has: assume it has one. Formats without
+    # sound or picture always say "none".
+    return value != "none"
+
+
+def row(*fields):
+    print(SEP.join(str(x).replace(SEP, " ").replace("\n", " ") for x in fields))
+
+
+def main(path):
+    with open(path, encoding="utf-8") as f:
+        info = json.load(f)
+    row("title", info.get("title") or info.get("id") or "")
+    if info.get("thumbnail"):
+        row("thumbnail", info["thumbnail"])
+    if info.get("_type") == "playlist":
+        row("playlist", info.get("playlist_count") or len(info.get("entries") or []))
+        return
+    formats = [f for f in info.get("formats") or [info] if f.get("url") or f.get("format_id")]
+    formats = [f for f in formats if "storyboard" not in (f.get("format_note") or "") and f.get("ext") != "mhtml"]
+
+    # Videos: the best of each height (and frame rate), H.264 first.
+    best = {}
+    for f in formats:
+        if f.get("vcodec") == "none":
+            continue
+        fps = f.get("fps") or 0
+        key = (f.get("height") or 0, 60 if fps > 30 else 30)
+        rank = (codec(f.get("vcodec")) == "H.264", f.get("tbr") or 0, has(f.get("acodec")))
+        if key not in best or rank > best[key][0]:
+            best[key] = (rank, f)
+    for (height, fps), (_, f) in sorted(best.items(), key=lambda kv: kv[0], reverse=True):
+        name = codec(f.get("vcodec"))
+        label = f"{height}p" + ("60" if fps == 60 else "") if height else (f.get("format_note") or f.get("ext") or "Video")
+        plays = "plays everywhere" if name in ("H.264", "") else "may not play in Files"
+        detail = " · ".join(x for x in (name, size(f), plays) if x)
+        row("video", f["format_id"], label, detail, 1 if has(f.get("acodec")) else 0)
+
+    # Sounds on their own: one of each codec, bitrate and language, best first.
+    seen, sounds = set(), []
+    languages = {f.get("language") for f in formats if f.get("vcodec") == "none" and has(f.get("acodec"))}
+    for f in formats:
+        if f.get("vcodec") != "none" or not has(f.get("acodec")) or "drc" in str(f.get("format_id")):
+            continue
+        name, rate = codec(f.get("acodec")), round(f.get("abr") or f.get("tbr") or 0)
+        key = (name, rate, f.get("language"))
+        if key in seen:
+            continue
+        seen.add(key)
+        sounds.append((rate, name == "AAC", f, name))
+    for rate, _, f, name in sorted(sounds, key=lambda s: (s[1], s[0]), reverse=True)[:8]:
+        label = " · ".join(x for x in (name, f"{rate} kbps" if rate else "") if x)
+        if len(languages) > 1 and f.get("language"):
+            label += f" · {f['language']}"
+        plays = "plays everywhere" if name in ("AAC", "MP3") else "may not play everywhere"
+        row("audio", f["format_id"], label, " · ".join(x for x in (size(f), plays) if x))
+
+
+if __name__ == "__main__":
+    main(sys.argv[1])
+FORMATS_PY
+mv -f /usr/local/share/dl/formats.py.new /usr/local/share/dl/formats.py
 touch /root/Downloads/.logs/.v2
 # dl's update compares the repository's copy of this script against this hash.
 sha256sum <"$0" | cut -d' ' -f1 >/root/Downloads/.logs/.setup
 echo "Installed dl."
 
-# The shortcut only needs importing again when it changed: 3-1155b9e4 identifies this one.
+# The shortcut only needs importing again when it changed: 4-299ecfe8 identifies this one.
 mkdir -p /root/Shortcuts
 cd /root/Shortcuts || exit 1
 rm -f "Download with aria2.shortcut" "Download Status.shortcut" "Stop Downloads.shortcut"
 new_shortcut=
-if [ "$(cat .version 2>/dev/null)" = 3-1155b9e4 ] && [ -e aria2.shortcut ]; then
+if [ "$(cat .version 2>/dev/null)" = 4-299ecfe8 ] && [ -e aria2.shortcut ]; then
   echo "The aria2 shortcut hasn't changed: no need to import it again."
 else
   echo "=== app Signing the new shortcut"
   if ! curl -sS -m 90 -X POST -H 'Content-Type: application/json' --data-binary @- \
       https://hubsign.routinehub.services/sign -o aria2.shortcut.new <<'EOF'
-{"shortcutName": "aria2", "shortcut": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict><key>WFQuickActionSurfaces</key><array/><key>WFWorkflowActions</key><array><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>E1F4B6AD-67A9-59C2-BF5A-CB1B74923CCD</string><key>WFCondition</key><integer>100</integer><key>WFControlFlowMode</key><integer>0</integer><key>WFInput</key><dict><key>Type</key><string>Variable</string><key>Variable</key><dict><key>Value</key><dict><key>Type</key><string>ExtensionInput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.gettext</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>BED918ED-F354-5434-BA9E-D905CB142757</string><key>WFTextActionText</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{0, 1}</key><dict><key>Type</key><string>ExtensionInput</string></dict></dict><key>string</key><string>\ufffc</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.base64encode</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>B97D1C35-25A7-5189-A47A-7D4F94C5F127</string><key>WFEncodeMode</key><string>Encode</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Text</string><key>OutputUUID</key><string>BED918ED-F354-5434-BA9E-D905CB142757</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>app.ish.iSH-AOK.ISHRunCommandIntent</string><key>WFWorkflowActionParameters</key><dict><key>AppIntentDescriptor</key><dict><key>AppIntentIdentifier</key><string>ISHRunCommandIntent</string><key>BundleIdentifier</key><string>app.ish.iSH-AOK</string><key>Name</key><string>iSH-AOK</string><key>TeamIdentifier</key><string>UYU5FM4LQ4</string></dict><key>UUID</key><string>EA3FF6EE-418E-5F16-A20E-4F532F08F4A8</string><key>command</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{7, 1}</key><dict><key>OutputName</key><string>Base64 Encoded</string><key>OutputUUID</key><string>B97D1C35-25A7-5189-A47A-7D4F94C5F127</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>dl -b '\ufffc'</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.notification</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>24F635B4-38FF-5407-BDEC-39229497076E</string><key>WFNotificationActionBody</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{0, 1}</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>EA3FF6EE-418E-5F16-A20E-4F532F08F4A8</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>\ufffc</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict><key>WFNotificationActionTitle</key><string>aria2</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.exit</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>D48DE1D5-0ADD-51BD-A2AF-E7E1F145CFCA</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>E1F4B6AD-67A9-59C2-BF5A-CB1B74923CCD</string><key>UUID</key><string>D0999766-74CF-55F4-9C0C-44D58EB1FB11</string><key>WFControlFlowMode</key><integer>2</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.gettext</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>6C3A90F4-177F-5D72-B348-2C15796D58F4</string><key>WFTextActionText</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict/><key>string</key><string>@@start</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.setvariable</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>C2269D23-F4DF-5D8C-A0CC-557EAD7601C7</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Text</string><key>OutputUUID</key><string>6C3A90F4-177F-5D72-B348-2C15796D58F4</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict><key>WFVariableName</key><string>tapped</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.repeat.count</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>1E6D665A-7B0B-53F7-A21F-489548C775A4</string><key>WFControlFlowMode</key><integer>0</integer><key>WFRepeatCount</key><integer>500</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.gettext</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>F198A729-B979-5AEA-A1A9-F53CFB201E53</string><key>WFTextActionText</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{0, 1}</key><dict><key>Type</key><string>Variable</string><key>VariableName</key><string>tapped</string></dict></dict><key>string</key><string>\ufffc</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.base64encode</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>4F1124D2-903A-5DC7-B601-9FFB02E393FF</string><key>WFEncodeMode</key><string>Encode</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Text</string><key>OutputUUID</key><string>F198A729-B979-5AEA-A1A9-F53CFB201E53</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>app.ish.iSH-AOK.ISHRunCommandIntent</string><key>WFWorkflowActionParameters</key><dict><key>AppIntentDescriptor</key><dict><key>AppIntentIdentifier</key><string>ISHRunCommandIntent</string><key>BundleIdentifier</key><string>app.ish.iSH-AOK</string><key>Name</key><string>iSH-AOK</string><key>TeamIdentifier</key><string>UYU5FM4LQ4</string></dict><key>UUID</key><string>FE6DC3C4-E47E-59B7-91C9-60BE4EF0460E</string><key>command</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{11, 1}</key><dict><key>OutputName</key><string>Base64 Encoded</string><key>OutputUUID</key><string>4F1124D2-903A-5DC7-B601-9FFB02E393FF</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>dl -ui -b '\ufffc' -k 3-1155b9e4</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>F354A175-D460-5F86-B1E5-C4326E8A1709</string><key>WFCondition</key><integer>8</integer><key>WFConditionalActionString</key><string>@@open:</string><key>WFControlFlowMode</key><integer>0</integer><key>WFInput</key><dict><key>Type</key><string>Variable</string><key>Variable</key><dict><key>Value</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>FE6DC3C4-E47E-59B7-91C9-60BE4EF0460E</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.text.replace</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>2179F174-6518-577C-8BC8-559B77F5C121</string><key>WFInput</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{0, 1}</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>FE6DC3C4-E47E-59B7-91C9-60BE4EF0460E</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>\ufffc</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict><key>WFReplaceTextFind</key><string>@@open:</string><key>WFReplaceTextReplace</key><string></string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.openurl</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>DD1EE042-CEF0-54E5-A149-CCFE81FC904B</string><key>WFInput</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{0, 1}</key><dict><key>OutputName</key><string>Updated Text</string><key>OutputUUID</key><string>2179F174-6518-577C-8BC8-559B77F5C121</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>\ufffc</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.exit</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>5C78ED84-535E-5629-981D-D11D0C9CD6B6</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>F354A175-D460-5F86-B1E5-C4326E8A1709</string><key>UUID</key><string>5065E054-14A7-5BD2-B4AB-2D7C3AE4DD08</string><key>WFControlFlowMode</key><integer>2</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>A28B8443-B7AA-537B-B71C-C2B2FAF269DC</string><key>WFCondition</key><integer>8</integer><key>WFConditionalActionString</key><string>@@exit</string><key>WFControlFlowMode</key><integer>0</integer><key>WFInput</key><dict><key>Type</key><string>Variable</string><key>Variable</key><dict><key>Value</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>FE6DC3C4-E47E-59B7-91C9-60BE4EF0460E</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.exit</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>0CCC5D47-58B8-565C-AC50-6F6D286A4C50</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>A28B8443-B7AA-537B-B71C-C2B2FAF269DC</string><key>UUID</key><string>E247B0C6-41BF-5EC8-B143-B0826DDCDABF</string><key>WFControlFlowMode</key><integer>2</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>B5AC4394-0DF3-5820-9CDE-6D5CB16611B8</string><key>WFCondition</key><integer>8</integer><key>WFConditionalActionString</key><string>@@app</string><key>WFControlFlowMode</key><integer>0</integer><key>WFInput</key><dict><key>Type</key><string>Variable</string><key>Variable</key><dict><key>Value</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>FE6DC3C4-E47E-59B7-91C9-60BE4EF0460E</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.openapp</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>3E48D5EC-CDD1-5903-8C4C-7DE4B0B64027</string><key>WFAppIdentifier</key><string>app.ish.iSH-AOK</string><key>WFSelectedApp</key><dict><key>BundleIdentifier</key><string>app.ish.iSH-AOK</string><key>Name</key><string>iSH-AOK</string><key>TeamIdentifier</key><string>UYU5FM4LQ4</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.exit</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>429A86DB-F4BA-5E43-A602-4A1B8D55B326</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>B5AC4394-0DF3-5820-9CDE-6D5CB16611B8</string><key>UUID</key><string>666AA480-0920-529E-9707-AB30625979FF</string><key>WFControlFlowMode</key><integer>2</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>38885350-296C-58C8-8969-65B615371003</string><key>WFCondition</key><integer>8</integer><key>WFConditionalActionString</key><string>@@import</string><key>WFControlFlowMode</key><integer>0</integer><key>WFInput</key><dict><key>Type</key><string>Variable</string><key>Variable</key><dict><key>Value</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>FE6DC3C4-E47E-59B7-91C9-60BE4EF0460E</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>app.ish.iSH-AOK.ISHRunCommandIntent</string><key>WFWorkflowActionParameters</key><dict><key>AppIntentDescriptor</key><dict><key>AppIntentIdentifier</key><string>ISHRunCommandIntent</string><key>BundleIdentifier</key><string>app.ish.iSH-AOK</string><key>Name</key><string>iSH-AOK</string><key>TeamIdentifier</key><string>UYU5FM4LQ4</string></dict><key>UUID</key><string>36777070-17A6-5E65-9712-079317FF9FB6</string><key>command</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict/><key>string</key><string>dl --shortcut</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.base64encode</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>F1E85EB1-E09A-54C1-9DCD-114948B8FED0</string><key>WFEncodeMode</key><string>Decode</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>36777070-17A6-5E65-9712-079317FF9FB6</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.setitemname</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>69362F2D-F688-5A92-AD91-1D1940C479F8</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Base64 Decoded</string><key>OutputUUID</key><string>F1E85EB1-E09A-54C1-9DCD-114948B8FED0</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict><key>WFName</key><string>aria2.shortcut</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.openin</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>C5CFB350-B5E3-56AA-A5F6-5323C3F6C736</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Renamed Item</string><key>OutputUUID</key><string>69362F2D-F688-5A92-AD91-1D1940C479F8</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict><key>WFOpenInAskWhenRun</key><false/></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.exit</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>2728493E-8E4B-5E30-A9FE-ABAF2CCBAD1D</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>38885350-296C-58C8-8969-65B615371003</string><key>UUID</key><string>E337AF9F-B960-5D5A-8B66-701D83FAC389</string><key>WFControlFlowMode</key><integer>2</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>BE30355B-89ED-518C-A5AB-1A797141D0C3</string><key>WFCondition</key><integer>8</integer><key>WFConditionalActionString</key><string>@@clipboard</string><key>WFControlFlowMode</key><integer>0</integer><key>WFInput</key><dict><key>Type</key><string>Variable</string><key>Variable</key><dict><key>Value</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>FE6DC3C4-E47E-59B7-91C9-60BE4EF0460E</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.getclipboard</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>47EE881A-114E-5499-B514-818ED46A4800</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.gettext</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>6EE464CB-F90C-58FB-B970-79F3FDF2827D</string><key>WFTextActionText</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{0, 1}</key><dict><key>OutputName</key><string>Clipboard</string><key>OutputUUID</key><string>47EE881A-114E-5499-B514-818ED46A4800</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>\ufffc</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.base64encode</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>D8DC0482-9C60-5685-B933-34EF4510D812</string><key>WFEncodeMode</key><string>Encode</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Text</string><key>OutputUUID</key><string>6EE464CB-F90C-58FB-B970-79F3FDF2827D</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>app.ish.iSH-AOK.ISHRunCommandIntent</string><key>WFWorkflowActionParameters</key><dict><key>AppIntentDescriptor</key><dict><key>AppIntentIdentifier</key><string>ISHRunCommandIntent</string><key>BundleIdentifier</key><string>app.ish.iSH-AOK</string><key>Name</key><string>iSH-AOK</string><key>TeamIdentifier</key><string>UYU5FM4LQ4</string></dict><key>UUID</key><string>E3FC5DAF-C0FF-5042-8122-F695F89B57D7</string><key>command</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{7, 1}</key><dict><key>OutputName</key><string>Base64 Encoded</string><key>OutputUUID</key><string>D8DC0482-9C60-5685-B933-34EF4510D812</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>dl -b '\ufffc'</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.notification</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>73DD6031-63B2-5A6E-AC26-13781BFBDC60</string><key>WFNotificationActionBody</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{0, 1}</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>E3FC5DAF-C0FF-5042-8122-F695F89B57D7</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>\ufffc</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict><key>WFNotificationActionTitle</key><string>aria2</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.gettext</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>DA6C0236-2549-5C31-AF23-CC7A266F194D</string><key>WFTextActionText</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict/><key>string</key><string></string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.setvariable</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>8155786D-653A-5C86-9427-ADAB2D38D93C</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Text</string><key>OutputUUID</key><string>DA6C0236-2549-5C31-AF23-CC7A266F194D</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict><key>WFVariableName</key><string>tapped</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>BE30355B-89ED-518C-A5AB-1A797141D0C3</string><key>WFControlFlowMode</key><integer>1</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>42C63D90-61D7-505D-B433-6CF42AF52842</string><key>WFCondition</key><integer>8</integer><key>WFConditionalActionString</key><string>@@web:</string><key>WFControlFlowMode</key><integer>0</integer><key>WFInput</key><dict><key>Type</key><string>Variable</string><key>Variable</key><dict><key>Value</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>FE6DC3C4-E47E-59B7-91C9-60BE4EF0460E</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.text.replace</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>458D9A09-77B6-5061-8314-6AB706925BD8</string><key>WFInput</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{0, 1}</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>FE6DC3C4-E47E-59B7-91C9-60BE4EF0460E</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>\ufffc</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict><key>WFReplaceTextFind</key><string>@@web:</string><key>WFReplaceTextReplace</key><string></string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.showwebpage</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>387F9BC9-4D52-5641-A450-A0D0376E58EB</string><key>WFURL</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{0, 1}</key><dict><key>OutputName</key><string>Updated Text</string><key>OutputUUID</key><string>458D9A09-77B6-5061-8314-6AB706925BD8</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>\ufffc</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.gettext</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>451A26C5-FA1B-549F-8BA7-8E9C3C7F0284</string><key>WFTextActionText</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict/><key>string</key><string></string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.setvariable</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>5AC0AEB6-B2A8-5B23-B9A9-9512B9794D70</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Text</string><key>OutputUUID</key><string>451A26C5-FA1B-549F-8BA7-8E9C3C7F0284</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict><key>WFVariableName</key><string>tapped</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>42C63D90-61D7-505D-B433-6CF42AF52842</string><key>WFControlFlowMode</key><integer>1</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>A141F8C6-4FF1-522A-8294-423425D56BA8</string><key>WFCondition</key><integer>8</integer><key>WFConditionalActionString</key><string>@@copy:</string><key>WFControlFlowMode</key><integer>0</integer><key>WFInput</key><dict><key>Type</key><string>Variable</string><key>Variable</key><dict><key>Value</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>FE6DC3C4-E47E-59B7-91C9-60BE4EF0460E</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.text.replace</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>F6F3640E-A921-54E0-AC76-5BA92701F644</string><key>WFInput</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{0, 1}</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>FE6DC3C4-E47E-59B7-91C9-60BE4EF0460E</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>\ufffc</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict><key>WFReplaceTextFind</key><string>@@copy:</string><key>WFReplaceTextReplace</key><string></string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.setclipboard</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>0599795A-E196-54AB-B8C7-07F0FC38D295</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Updated Text</string><key>OutputUUID</key><string>F6F3640E-A921-54E0-AC76-5BA92701F644</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.gettext</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>714249A7-ED9E-5990-BD38-3D8B61C6F58E</string><key>WFTextActionText</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict/><key>string</key><string></string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.setvariable</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>1CD8A600-067C-592F-99ED-7EBB9EEEF170</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Text</string><key>OutputUUID</key><string>714249A7-ED9E-5990-BD38-3D8B61C6F58E</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict><key>WFVariableName</key><string>tapped</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>A141F8C6-4FF1-522A-8294-423425D56BA8</string><key>WFControlFlowMode</key><integer>1</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>B3733656-4024-551D-AB8A-64C6ADED8EA6</string><key>WFCondition</key><integer>8</integer><key>WFConditionalActionString</key><string>@@share:</string><key>WFControlFlowMode</key><integer>0</integer><key>WFInput</key><dict><key>Type</key><string>Variable</string><key>Variable</key><dict><key>Value</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>FE6DC3C4-E47E-59B7-91C9-60BE4EF0460E</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.text.replace</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>1DA1821D-0099-590C-B058-8DE38222914A</string><key>WFInput</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{0, 1}</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>FE6DC3C4-E47E-59B7-91C9-60BE4EF0460E</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>\ufffc</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict><key>WFReplaceTextFind</key><string>@@share:</string><key>WFReplaceTextReplace</key><string></string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.share</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>47A60CB7-61A3-541A-A182-A87EBD543B4B</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Updated Text</string><key>OutputUUID</key><string>1DA1821D-0099-590C-B058-8DE38222914A</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.gettext</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>576B934D-56E0-5869-B49C-1DA7E64DC7AD</string><key>WFTextActionText</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict/><key>string</key><string></string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.setvariable</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>06C23BA9-F48F-5BC4-8065-BF6EA60C0F05</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Text</string><key>OutputUUID</key><string>576B934D-56E0-5869-B49C-1DA7E64DC7AD</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict><key>WFVariableName</key><string>tapped</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>B3733656-4024-551D-AB8A-64C6ADED8EA6</string><key>WFControlFlowMode</key><integer>1</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>2532199C-09D9-5292-BE50-AE3220672C03</string><key>WFCondition</key><integer>8</integer><key>WFConditionalActionString</key><string>BEGIN:VCARD</string><key>WFControlFlowMode</key><integer>0</integer><key>WFInput</key><dict><key>Type</key><string>Variable</string><key>Variable</key><dict><key>Value</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>FE6DC3C4-E47E-59B7-91C9-60BE4EF0460E</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.gettext</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>8048D745-D334-5D8D-A20C-6E04E6829579</string><key>WFTextActionText</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{0, 1}</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>FE6DC3C4-E47E-59B7-91C9-60BE4EF0460E</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>\ufffc</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.setitemname</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>8C8E0D4D-4CC8-521C-BC0B-39DBB55F65E6</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Text</string><key>OutputUUID</key><string>8048D745-D334-5D8D-A20C-6E04E6829579</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict><key>WFName</key><string>menu.vcf</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.choosefromlist</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>80C4B246-9B4C-5FED-BA5D-3A946B95B070</string><key>WFChooseFromListActionPrompt</key><string>aria2</string><key>WFInput</key><dict><key>Value</key><dict><key>Aggrandizements</key><array><dict><key>CoercionItemClass</key><string>WFContactContentItem</string><key>Type</key><string>WFCoercionVariableAggrandizement</string></dict></array><key>OutputName</key><string>Renamed Item</string><key>OutputUUID</key><string>8C8E0D4D-4CC8-521C-BC0B-39DBB55F65E6</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.properties.contacts</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>D440BE88-B806-5472-ABB6-62B5C6D5C69B</string><key>WFContentItemPropertyName</key><string>Name</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Chosen Item</string><key>OutputUUID</key><string>80C4B246-9B4C-5FED-BA5D-3A946B95B070</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.setvariable</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>F8D053F7-55AE-552E-B0F3-2050B9945842</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Name</string><key>OutputUUID</key><string>D440BE88-B806-5472-ABB6-62B5C6D5C69B</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict><key>WFVariableName</key><string>tapped</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>2532199C-09D9-5292-BE50-AE3220672C03</string><key>WFControlFlowMode</key><integer>1</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.text.split</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>C53A95D2-57A3-5802-B4D3-21B30DB5E5E6</string><key>WFTextSeparator</key><string>New Lines</string><key>text</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{0, 1}</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>FE6DC3C4-E47E-59B7-91C9-60BE4EF0460E</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>\ufffc</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.choosefromlist</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>DCC6515B-8266-58CD-B2F8-2246D1549220</string><key>WFChooseFromListActionPrompt</key><string>aria2</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Split Text</string><key>OutputUUID</key><string>C53A95D2-57A3-5802-B4D3-21B30DB5E5E6</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.setvariable</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>45F1A040-9322-52BA-9C80-CAE70FF38C02</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Chosen Item</string><key>OutputUUID</key><string>DCC6515B-8266-58CD-B2F8-2246D1549220</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict><key>WFVariableName</key><string>tapped</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>2532199C-09D9-5292-BE50-AE3220672C03</string><key>UUID</key><string>A3371A75-A5C9-5B48-BE69-C60535612111</string><key>WFControlFlowMode</key><integer>2</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>B3733656-4024-551D-AB8A-64C6ADED8EA6</string><key>UUID</key><string>F417E9B3-C2A7-5CF7-B016-473C25A265F0</string><key>WFControlFlowMode</key><integer>2</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>A141F8C6-4FF1-522A-8294-423425D56BA8</string><key>UUID</key><string>2FF51B12-FB4F-5E96-9CE5-80D6A927ABC4</string><key>WFControlFlowMode</key><integer>2</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>42C63D90-61D7-505D-B433-6CF42AF52842</string><key>UUID</key><string>98DFABCE-A6D5-54DB-A9E2-4915DF8E5EE6</string><key>WFControlFlowMode</key><integer>2</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>BE30355B-89ED-518C-A5AB-1A797141D0C3</string><key>UUID</key><string>9FED2806-3B08-5C61-8EB0-C276CDD34820</string><key>WFControlFlowMode</key><integer>2</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.repeat.count</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>1E6D665A-7B0B-53F7-A21F-489548C775A4</string><key>UUID</key><string>23268490-4581-5910-9EDC-7B08C8B8E3F8</string><key>WFControlFlowMode</key><integer>2</integer></dict></dict></array><key>WFWorkflowClientVersion</key><string>4033.0.4.3</string><key>WFWorkflowHasOutputFallback</key><false/><key>WFWorkflowHasShortcutInputVariables</key><true/><key>WFWorkflowIcon</key><dict><key>WFWorkflowIconGlyphNumber</key><integer>59693</integer><key>WFWorkflowIconStartColor</key><integer>431817727</integer></dict><key>WFWorkflowImportQuestions</key><array/><key>WFWorkflowInputContentItemClasses</key><array><string>WFURLContentItem</string><string>WFStringContentItem</string></array><key>WFWorkflowMinimumClientVersion</key><integer>900</integer><key>WFWorkflowMinimumClientVersionString</key><string>900</string><key>WFWorkflowOutputContentItemClasses</key><array/><key>WFWorkflowTypes</key><array><string>ActionExtension</string></array></dict></plist>\n"}
+{"shortcutName": "aria2", "shortcut": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict><key>WFQuickActionSurfaces</key><array/><key>WFWorkflowActions</key><array><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.gettext</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>E1F4B6AD-67A9-59C2-BF5A-CB1B74923CCD</string><key>WFTextActionText</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict/><key>string</key><string>@@start</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.setvariable</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>BED918ED-F354-5434-BA9E-D905CB142757</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Text</string><key>OutputUUID</key><string>E1F4B6AD-67A9-59C2-BF5A-CB1B74923CCD</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict><key>WFVariableName</key><string>tapped</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>B97D1C35-25A7-5189-A47A-7D4F94C5F127</string><key>WFCondition</key><integer>100</integer><key>WFControlFlowMode</key><integer>0</integer><key>WFInput</key><dict><key>Type</key><string>Variable</string><key>Variable</key><dict><key>Value</key><dict><key>Type</key><string>ExtensionInput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.gettext</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>EA3FF6EE-418E-5F16-A20E-4F532F08F4A8</string><key>WFTextActionText</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{6, 1}</key><dict><key>Type</key><string>ExtensionInput</string></dict></dict><key>string</key><string>@@add:\ufffc</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.setvariable</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>24F635B4-38FF-5407-BDEC-39229497076E</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Text</string><key>OutputUUID</key><string>EA3FF6EE-418E-5F16-A20E-4F532F08F4A8</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict><key>WFVariableName</key><string>tapped</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>B97D1C35-25A7-5189-A47A-7D4F94C5F127</string><key>UUID</key><string>D48DE1D5-0ADD-51BD-A2AF-E7E1F145CFCA</string><key>WFControlFlowMode</key><integer>2</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.repeat.count</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>D0999766-74CF-55F4-9C0C-44D58EB1FB11</string><key>WFControlFlowMode</key><integer>0</integer><key>WFRepeatCount</key><integer>500</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.gettext</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>6C3A90F4-177F-5D72-B348-2C15796D58F4</string><key>WFTextActionText</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{0, 1}</key><dict><key>Type</key><string>Variable</string><key>VariableName</key><string>tapped</string></dict></dict><key>string</key><string>\ufffc</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.base64encode</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>C2269D23-F4DF-5D8C-A0CC-557EAD7601C7</string><key>WFEncodeMode</key><string>Encode</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Text</string><key>OutputUUID</key><string>6C3A90F4-177F-5D72-B348-2C15796D58F4</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>app.ish.iSH-AOK.ISHRunCommandIntent</string><key>WFWorkflowActionParameters</key><dict><key>AppIntentDescriptor</key><dict><key>AppIntentIdentifier</key><string>ISHRunCommandIntent</string><key>BundleIdentifier</key><string>app.ish.iSH-AOK</string><key>Name</key><string>iSH-AOK</string><key>TeamIdentifier</key><string>UYU5FM4LQ4</string></dict><key>UUID</key><string>1E6D665A-7B0B-53F7-A21F-489548C775A4</string><key>command</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{11, 1}</key><dict><key>OutputName</key><string>Base64 Encoded</string><key>OutputUUID</key><string>C2269D23-F4DF-5D8C-A0CC-557EAD7601C7</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>dl -ui -b '\ufffc' -k 4-299ecfe8</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict><key>timeout</key><integer>120</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>F198A729-B979-5AEA-A1A9-F53CFB201E53</string><key>WFCondition</key><integer>8</integer><key>WFConditionalActionString</key><string>@@open:</string><key>WFControlFlowMode</key><integer>0</integer><key>WFInput</key><dict><key>Type</key><string>Variable</string><key>Variable</key><dict><key>Value</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>1E6D665A-7B0B-53F7-A21F-489548C775A4</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.text.replace</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>4F1124D2-903A-5DC7-B601-9FFB02E393FF</string><key>WFInput</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{0, 1}</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>1E6D665A-7B0B-53F7-A21F-489548C775A4</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>\ufffc</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict><key>WFReplaceTextFind</key><string>@@open:</string><key>WFReplaceTextReplace</key><string></string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.openurl</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>FE6DC3C4-E47E-59B7-91C9-60BE4EF0460E</string><key>WFInput</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{0, 1}</key><dict><key>OutputName</key><string>Updated Text</string><key>OutputUUID</key><string>4F1124D2-903A-5DC7-B601-9FFB02E393FF</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>\ufffc</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.exit</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>F354A175-D460-5F86-B1E5-C4326E8A1709</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>F198A729-B979-5AEA-A1A9-F53CFB201E53</string><key>UUID</key><string>2179F174-6518-577C-8BC8-559B77F5C121</string><key>WFControlFlowMode</key><integer>2</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>DD1EE042-CEF0-54E5-A149-CCFE81FC904B</string><key>WFCondition</key><integer>8</integer><key>WFConditionalActionString</key><string>@@exit</string><key>WFControlFlowMode</key><integer>0</integer><key>WFInput</key><dict><key>Type</key><string>Variable</string><key>Variable</key><dict><key>Value</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>1E6D665A-7B0B-53F7-A21F-489548C775A4</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.exit</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>5065E054-14A7-5BD2-B4AB-2D7C3AE4DD08</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>DD1EE042-CEF0-54E5-A149-CCFE81FC904B</string><key>UUID</key><string>A28B8443-B7AA-537B-B71C-C2B2FAF269DC</string><key>WFControlFlowMode</key><integer>2</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>5C78ED84-535E-5629-981D-D11D0C9CD6B6</string><key>WFCondition</key><integer>8</integer><key>WFConditionalActionString</key><string>@@app</string><key>WFControlFlowMode</key><integer>0</integer><key>WFInput</key><dict><key>Type</key><string>Variable</string><key>Variable</key><dict><key>Value</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>1E6D665A-7B0B-53F7-A21F-489548C775A4</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.openapp</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>B5AC4394-0DF3-5820-9CDE-6D5CB16611B8</string><key>WFAppIdentifier</key><string>app.ish.iSH-AOK</string><key>WFSelectedApp</key><dict><key>BundleIdentifier</key><string>app.ish.iSH-AOK</string><key>Name</key><string>iSH-AOK</string><key>TeamIdentifier</key><string>UYU5FM4LQ4</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.exit</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>0CCC5D47-58B8-565C-AC50-6F6D286A4C50</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>5C78ED84-535E-5629-981D-D11D0C9CD6B6</string><key>UUID</key><string>E247B0C6-41BF-5EC8-B143-B0826DDCDABF</string><key>WFControlFlowMode</key><integer>2</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>3E48D5EC-CDD1-5903-8C4C-7DE4B0B64027</string><key>WFCondition</key><integer>8</integer><key>WFConditionalActionString</key><string>@@import</string><key>WFControlFlowMode</key><integer>0</integer><key>WFInput</key><dict><key>Type</key><string>Variable</string><key>Variable</key><dict><key>Value</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>1E6D665A-7B0B-53F7-A21F-489548C775A4</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>app.ish.iSH-AOK.ISHRunCommandIntent</string><key>WFWorkflowActionParameters</key><dict><key>AppIntentDescriptor</key><dict><key>AppIntentIdentifier</key><string>ISHRunCommandIntent</string><key>BundleIdentifier</key><string>app.ish.iSH-AOK</string><key>Name</key><string>iSH-AOK</string><key>TeamIdentifier</key><string>UYU5FM4LQ4</string></dict><key>UUID</key><string>429A86DB-F4BA-5E43-A602-4A1B8D55B326</string><key>command</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict/><key>string</key><string>dl --shortcut</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.base64encode</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>666AA480-0920-529E-9707-AB30625979FF</string><key>WFEncodeMode</key><string>Decode</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>429A86DB-F4BA-5E43-A602-4A1B8D55B326</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.setitemname</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>38885350-296C-58C8-8969-65B615371003</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Base64 Decoded</string><key>OutputUUID</key><string>666AA480-0920-529E-9707-AB30625979FF</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict><key>WFName</key><string>aria2.shortcut</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.openin</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>36777070-17A6-5E65-9712-079317FF9FB6</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Renamed Item</string><key>OutputUUID</key><string>38885350-296C-58C8-8969-65B615371003</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict><key>WFOpenInAskWhenRun</key><false/></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.exit</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>F1E85EB1-E09A-54C1-9DCD-114948B8FED0</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>3E48D5EC-CDD1-5903-8C4C-7DE4B0B64027</string><key>UUID</key><string>69362F2D-F688-5A92-AD91-1D1940C479F8</string><key>WFControlFlowMode</key><integer>2</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>576B934D-56E0-5869-B49C-1DA7E64DC7AD</string><key>WFCondition</key><integer>8</integer><key>WFConditionalActionString</key><string>@@clipboard</string><key>WFControlFlowMode</key><integer>0</integer><key>WFInput</key><dict><key>Type</key><string>Variable</string><key>Variable</key><dict><key>Value</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>1E6D665A-7B0B-53F7-A21F-489548C775A4</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.getclipboard</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>C5CFB350-B5E3-56AA-A5F6-5323C3F6C736</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.gettext</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>2728493E-8E4B-5E30-A9FE-ABAF2CCBAD1D</string><key>WFTextActionText</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{8, 1}</key><dict><key>OutputName</key><string>Clipboard</string><key>OutputUUID</key><string>C5CFB350-B5E3-56AA-A5F6-5323C3F6C736</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>@@paste:\ufffc</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.setvariable</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>80C4B246-9B4C-5FED-BA5D-3A946B95B070</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Text</string><key>OutputUUID</key><string>2728493E-8E4B-5E30-A9FE-ABAF2CCBAD1D</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict><key>WFVariableName</key><string>tapped</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>576B934D-56E0-5869-B49C-1DA7E64DC7AD</string><key>WFControlFlowMode</key><integer>1</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>06C23BA9-F48F-5BC4-8065-BF6EA60C0F05</string><key>WFCondition</key><integer>8</integer><key>WFConditionalActionString</key><string>@@notify:</string><key>WFControlFlowMode</key><integer>0</integer><key>WFInput</key><dict><key>Type</key><string>Variable</string><key>Variable</key><dict><key>Value</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>1E6D665A-7B0B-53F7-A21F-489548C775A4</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.text.replace</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>E337AF9F-B960-5D5A-8B66-701D83FAC389</string><key>WFInput</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{0, 1}</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>1E6D665A-7B0B-53F7-A21F-489548C775A4</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>\ufffc</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict><key>WFReplaceTextFind</key><string>@@notify:</string><key>WFReplaceTextReplace</key><string></string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.notification</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>D440BE88-B806-5472-ABB6-62B5C6D5C69B</string><key>WFNotificationActionBody</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{0, 1}</key><dict><key>OutputName</key><string>Updated Text</string><key>OutputUUID</key><string>E337AF9F-B960-5D5A-8B66-701D83FAC389</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>\ufffc</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict><key>WFNotificationActionTitle</key><string>aria2</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.exit</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>C53A95D2-57A3-5802-B4D3-21B30DB5E5E6</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>06C23BA9-F48F-5BC4-8065-BF6EA60C0F05</string><key>WFControlFlowMode</key><integer>1</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>F8D053F7-55AE-552E-B0F3-2050B9945842</string><key>WFCondition</key><integer>8</integer><key>WFConditionalActionString</key><string>@@web:</string><key>WFControlFlowMode</key><integer>0</integer><key>WFInput</key><dict><key>Type</key><string>Variable</string><key>Variable</key><dict><key>Value</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>1E6D665A-7B0B-53F7-A21F-489548C775A4</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.text.replace</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>47EE881A-114E-5499-B514-818ED46A4800</string><key>WFInput</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{0, 1}</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>1E6D665A-7B0B-53F7-A21F-489548C775A4</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>\ufffc</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict><key>WFReplaceTextFind</key><string>@@web:</string><key>WFReplaceTextReplace</key><string></string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.showwebpage</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>DCC6515B-8266-58CD-B2F8-2246D1549220</string><key>WFURL</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{0, 1}</key><dict><key>OutputName</key><string>Updated Text</string><key>OutputUUID</key><string>47EE881A-114E-5499-B514-818ED46A4800</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>\ufffc</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.gettext</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>73DD6031-63B2-5A6E-AC26-13781BFBDC60</string><key>WFTextActionText</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict/><key>string</key><string></string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.setvariable</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>DA6C0236-2549-5C31-AF23-CC7A266F194D</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Text</string><key>OutputUUID</key><string>73DD6031-63B2-5A6E-AC26-13781BFBDC60</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict><key>WFVariableName</key><string>tapped</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>F8D053F7-55AE-552E-B0F3-2050B9945842</string><key>WFControlFlowMode</key><integer>1</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>45F1A040-9322-52BA-9C80-CAE70FF38C02</string><key>WFCondition</key><integer>8</integer><key>WFConditionalActionString</key><string>@@copy:</string><key>WFControlFlowMode</key><integer>0</integer><key>WFInput</key><dict><key>Type</key><string>Variable</string><key>Variable</key><dict><key>Value</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>1E6D665A-7B0B-53F7-A21F-489548C775A4</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.text.replace</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>6EE464CB-F90C-58FB-B970-79F3FDF2827D</string><key>WFInput</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{0, 1}</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>1E6D665A-7B0B-53F7-A21F-489548C775A4</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>\ufffc</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict><key>WFReplaceTextFind</key><string>@@copy:</string><key>WFReplaceTextReplace</key><string></string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.setclipboard</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>8155786D-653A-5C86-9427-ADAB2D38D93C</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Updated Text</string><key>OutputUUID</key><string>6EE464CB-F90C-58FB-B970-79F3FDF2827D</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.gettext</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>387F9BC9-4D52-5641-A450-A0D0376E58EB</string><key>WFTextActionText</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict/><key>string</key><string></string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.setvariable</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>451A26C5-FA1B-549F-8BA7-8E9C3C7F0284</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Text</string><key>OutputUUID</key><string>387F9BC9-4D52-5641-A450-A0D0376E58EB</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict><key>WFVariableName</key><string>tapped</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>45F1A040-9322-52BA-9C80-CAE70FF38C02</string><key>WFControlFlowMode</key><integer>1</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>BE30355B-89ED-518C-A5AB-1A797141D0C3</string><key>WFCondition</key><integer>8</integer><key>WFConditionalActionString</key><string>@@share:</string><key>WFControlFlowMode</key><integer>0</integer><key>WFInput</key><dict><key>Type</key><string>Variable</string><key>Variable</key><dict><key>Value</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>1E6D665A-7B0B-53F7-A21F-489548C775A4</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.text.replace</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>D8DC0482-9C60-5685-B933-34EF4510D812</string><key>WFInput</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{0, 1}</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>1E6D665A-7B0B-53F7-A21F-489548C775A4</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>\ufffc</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict><key>WFReplaceTextFind</key><string>@@share:</string><key>WFReplaceTextReplace</key><string></string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.share</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>5AC0AEB6-B2A8-5B23-B9A9-9512B9794D70</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Updated Text</string><key>OutputUUID</key><string>D8DC0482-9C60-5685-B933-34EF4510D812</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.gettext</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>0599795A-E196-54AB-B8C7-07F0FC38D295</string><key>WFTextActionText</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict/><key>string</key><string></string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.setvariable</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>714249A7-ED9E-5990-BD38-3D8B61C6F58E</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Text</string><key>OutputUUID</key><string>0599795A-E196-54AB-B8C7-07F0FC38D295</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict><key>WFVariableName</key><string>tapped</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>BE30355B-89ED-518C-A5AB-1A797141D0C3</string><key>WFControlFlowMode</key><integer>1</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>42C63D90-61D7-505D-B433-6CF42AF52842</string><key>WFCondition</key><integer>8</integer><key>WFConditionalActionString</key><string>BEGIN:VCARD</string><key>WFControlFlowMode</key><integer>0</integer><key>WFInput</key><dict><key>Type</key><string>Variable</string><key>Variable</key><dict><key>Value</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>1E6D665A-7B0B-53F7-A21F-489548C775A4</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.gettext</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>E3FC5DAF-C0FF-5042-8122-F695F89B57D7</string><key>WFTextActionText</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{0, 1}</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>1E6D665A-7B0B-53F7-A21F-489548C775A4</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>\ufffc</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.setitemname</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>458D9A09-77B6-5061-8314-6AB706925BD8</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Text</string><key>OutputUUID</key><string>E3FC5DAF-C0FF-5042-8122-F695F89B57D7</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict><key>WFName</key><string>menu.vcf</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.choosefromlist</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>F6F3640E-A921-54E0-AC76-5BA92701F644</string><key>WFChooseFromListActionPrompt</key><string>aria2</string><key>WFInput</key><dict><key>Value</key><dict><key>Aggrandizements</key><array><dict><key>CoercionItemClass</key><string>WFContactContentItem</string><key>Type</key><string>WFCoercionVariableAggrandizement</string></dict></array><key>OutputName</key><string>Renamed Item</string><key>OutputUUID</key><string>458D9A09-77B6-5061-8314-6AB706925BD8</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.properties.contacts</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>1DA1821D-0099-590C-B058-8DE38222914A</string><key>WFContentItemPropertyName</key><string>Name</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Chosen Item</string><key>OutputUUID</key><string>F6F3640E-A921-54E0-AC76-5BA92701F644</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.setvariable</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>1CD8A600-067C-592F-99ED-7EBB9EEEF170</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Name</string><key>OutputUUID</key><string>1DA1821D-0099-590C-B058-8DE38222914A</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict><key>WFVariableName</key><string>tapped</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>42C63D90-61D7-505D-B433-6CF42AF52842</string><key>WFControlFlowMode</key><integer>1</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.text.split</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>8048D745-D334-5D8D-A20C-6E04E6829579</string><key>WFTextSeparator</key><string>New Lines</string><key>text</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{0, 1}</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>1E6D665A-7B0B-53F7-A21F-489548C775A4</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>\ufffc</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.choosefromlist</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>8C8E0D4D-4CC8-521C-BC0B-39DBB55F65E6</string><key>WFChooseFromListActionPrompt</key><string>aria2</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Split Text</string><key>OutputUUID</key><string>8048D745-D334-5D8D-A20C-6E04E6829579</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.setvariable</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>47A60CB7-61A3-541A-A182-A87EBD543B4B</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Chosen Item</string><key>OutputUUID</key><string>8C8E0D4D-4CC8-521C-BC0B-39DBB55F65E6</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict><key>WFVariableName</key><string>tapped</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>42C63D90-61D7-505D-B433-6CF42AF52842</string><key>UUID</key><string>A141F8C6-4FF1-522A-8294-423425D56BA8</string><key>WFControlFlowMode</key><integer>2</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>BE30355B-89ED-518C-A5AB-1A797141D0C3</string><key>UUID</key><string>B3733656-4024-551D-AB8A-64C6ADED8EA6</string><key>WFControlFlowMode</key><integer>2</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>45F1A040-9322-52BA-9C80-CAE70FF38C02</string><key>UUID</key><string>2532199C-09D9-5292-BE50-AE3220672C03</string><key>WFControlFlowMode</key><integer>2</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>F8D053F7-55AE-552E-B0F3-2050B9945842</string><key>UUID</key><string>A3371A75-A5C9-5B48-BE69-C60535612111</string><key>WFControlFlowMode</key><integer>2</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>06C23BA9-F48F-5BC4-8065-BF6EA60C0F05</string><key>UUID</key><string>F417E9B3-C2A7-5CF7-B016-473C25A265F0</string><key>WFControlFlowMode</key><integer>2</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>576B934D-56E0-5869-B49C-1DA7E64DC7AD</string><key>UUID</key><string>2FF51B12-FB4F-5E96-9CE5-80D6A927ABC4</string><key>WFControlFlowMode</key><integer>2</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.repeat.count</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>D0999766-74CF-55F4-9C0C-44D58EB1FB11</string><key>UUID</key><string>98DFABCE-A6D5-54DB-A9E2-4915DF8E5EE6</string><key>WFControlFlowMode</key><integer>2</integer></dict></dict></array><key>WFWorkflowClientVersion</key><string>4033.0.4.3</string><key>WFWorkflowHasOutputFallback</key><false/><key>WFWorkflowHasShortcutInputVariables</key><true/><key>WFWorkflowIcon</key><dict><key>WFWorkflowIconGlyphNumber</key><integer>59693</integer><key>WFWorkflowIconStartColor</key><integer>431817727</integer></dict><key>WFWorkflowImportQuestions</key><array/><key>WFWorkflowInputContentItemClasses</key><array><string>WFURLContentItem</string><string>WFStringContentItem</string></array><key>WFWorkflowMinimumClientVersion</key><integer>900</integer><key>WFWorkflowMinimumClientVersionString</key><string>900</string><key>WFWorkflowOutputContentItemClasses</key><array/><key>WFWorkflowTypes</key><array><string>ActionExtension</string></array></dict></plist>\n"}
 EOF
   then
     echo "FAILED to sign the shortcut: no answer from HubSign."
   elif [ "$(head -c 4 aria2.shortcut.new)" = AEA1 ]; then
     mv -f aria2.shortcut.new aria2.shortcut
-    echo 3-1155b9e4 >.version
+    echo 4-299ecfe8 >.version
     new_shortcut=/root/Shortcuts/aria2.shortcut
     # Also into the Files folder mounted at /mnt/phone, always as aria2.shortcut, in place
     # of the one before: copied in under another name first, because writing into a file

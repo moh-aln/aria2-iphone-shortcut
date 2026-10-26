@@ -113,30 +113,84 @@ fetch_file() {
     --show-console-readout=false --summary-interval=5 "$1"
 }
 
-fetch_video() {  # fetch_video <link> <id>
-  # The JavaScript engine yt-dlp uses to work out YouTube's video links: Node when it's
-  # installed (about 4 times faster than QuickJS in iSH-AOK on an iPhone), else QuickJS.
-  js=
+# The JavaScript engine yt-dlp uses to work out YouTube's video links: Node when it's
+# installed (about 4 times faster than QuickJS in iSH-AOK on an iPhone), else QuickJS.
+js_runtime() {
   if command -v node >/dev/null; then
-    js='--js-runtimes node'
+    echo '--js-runtimes node'
   elif command -v qjs >/dev/null; then
-    js='--js-runtimes quickjs'
+    echo '--js-runtimes quickjs'
   fi
-  # Prefer H.264 in MP4, which the iPhone plays everywhere. Progress is printed in the
-  # same shape as aria2's summaries, so the list reads both the same way. The title and
-  # the final file come from --exec, not --print, which would hide yt-dlp's other output:
-  # the step it's on is what the list shows until the download starts.
+}
+
+# Quick downloads pick their quality by a rule, set in Settings (.logs/.quality).
+# rule_format [<rule>] prints yt-dlp's -f for it, and then "audio" for sound only.
+rule_format() {
+  case ${1:-$(cat "$JOBS/.quality" 2>/dev/null)} in
+    best) echo 'bv*+ba/b' ;;
+    720 | 480)
+      h=${1:-$(cat "$JOBS/.quality")}
+      echo "bv*[vcodec^=avc1][height<=$h]+ba[ext=m4a]/b[ext=mp4][height<=$h]/bv*[height<=$h]+ba/b[height<=$h]/b" ;;
+    audio) echo 'ba[ext=m4a]/ba/b'; echo audio ;;
+    *) echo 'bv*[vcodec^=avc1]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b' ;;  # best for iPhone: H.264, up to 1080p on YouTube
+  esac
+}
+
+rule_label() {  # rule_label [<rule>]
+  case ${1:-$(cat "$JOBS/.quality" 2>/dev/null)} in
+    best) echo "Best quality" ;;
+    720) echo "720p" ;;
+    480) echo "480p" ;;
+    audio) echo "Audio only" ;;
+    *) echo "Best for iPhone" ;;
+  esac
+}
+
+rule_detail() {  # rule_detail [<rule>]
+  case ${1:-$(cat "$JOBS/.quality" 2>/dev/null)} in
+    best) echo "Up to 4K; some may not play in Files" ;;
+    720) echo "H.264 at 720p: smaller files" ;;
+    480) echo "H.264 at 480p: the smallest videos" ;;
+    audio) echo "Just the sound, as M4A" ;;
+    *) echo "H.264 up to 1080p: plays everywhere" ;;
+  esac
+}
+
+fetch_video() {  # fetch_video <link> <id>
+  # The quality: the one picked for this download (.fmt: -f, then "audio" for sound only),
+  # else the quick download rule.
+  fmt=$(sed -n 1p "$JOBS/$2.fmt" 2>/dev/null)
+  sound=$(sed -n 2p "$JOBS/$2.fmt" 2>/dev/null)
+  if [ -z "$fmt" ]; then
+    fmt=$(rule_format | sed -n 1p)
+    sound=$(rule_format | sed -n 2p)
+  fi
+  if [ "$sound" = audio ]; then
+    as='-x --audio-format m4a'  # Opus and the like become AAC, which the iPhone plays
+  else
+    as='--merge-output-format mp4'
+  fi
+  # When the quality was picked from a list, yt-dlp has already found the video once:
+  # downloading from what it found then saves doing it again (a minute on YouTube). Its
+  # links last for hours, but an older one is found again.
+  from=$1
+  info=$JOBS/$2.info.json
+  [ -n "$(find "$JOBS" -maxdepth 1 -name "$2.info.json" -mmin -60 2>/dev/null)" ] || info=
+  # Progress is printed in the same shape as aria2's summaries, so the list reads both the
+  # same way. The title and the final file come from --exec, not --print, which would hide
+  # yt-dlp's other output: the step it's on is what the list shows until the download
+  # starts.
   # A playlist link downloads the playlist into a folder named after it; a video link that
   # happens to come from a playlist (watch?v=…&list=…) downloads just that video.
   # Before each video, its picture is fetched in the background for the menus (see thumb).
   # -v puts yt-dlp's versions and every step it takes in the log, for the debug report
   # (see report); the list leaves its "[debug]" lines out.
-  yt-dlp -v --newline --no-playlist --no-mtime -P "$DEST" -o '%(playlist_title|.).80B/%(title).80B.%(ext)s' \
-    -f 'bv*[vcodec^=avc1]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b' --merge-output-format mp4 $js \
+  set -- -v --newline --no-playlist --no-mtime -P "$DEST" -o '%(playlist_title|.).80B/%(title).80B.%(ext)s' \
+    -f "$fmt" $as $(js_runtime) \
     --exec 'before_dl:echo NAME: %(title)q' --exec 'after_move:echo FILE: %(filepath)q' \
     --exec "before_dl:sh '$0' --thumb $2 %(thumbnail)q >/dev/null 2>&1 &" \
-    --progress-template 'download:[#yt %(progress._downloaded_bytes_str)s/%(progress._total_bytes_str)s(%(progress._percent_str)s) DL:%(progress._speed_str)s ETA:%(progress._eta_str)s]' \
-    "$1"
+    --progress-template 'download:[#yt %(progress._downloaded_bytes_str)s/%(progress._total_bytes_str)s(%(progress._percent_str)s) DL:%(progress._speed_str)s ETA:%(progress._eta_str)s]'
+  if [ -n "$info" ]; then yt-dlp "$@" --load-info-json "$info"; else yt-dlp "$@" "$from"; fi
 }
 
 work() {  # work <id>: the background worker, for as long as the download takes
@@ -174,17 +228,106 @@ work() {  # work <id>: the background worker, for as long as the download takes
 }
 
 # thumb <id> <picture link>: a small square of the video's picture, base64, for the menus.
-thumb() {
+thumb() { thumb_to "$JOBS/$1.thumb" "$2"; }
+
+thumb_to() {  # thumb_to <file> <picture link>
   case $2 in http*) ;; *) return 0 ;; esac
   command -v ffmpeg >/dev/null || return 0
   # YouTube's best picture is large; the 320x180 one is plenty.
   url=$(printf %s "$2" | sed -E 's|^https?://i\.ytimg\.com/vi(_webp)?/([^/]+)/.*|https://i.ytimg.com/vi/\2/mqdefault.jpg|')
-  tmp=$JOBS/$1.thumb.$$
+  tmp=$1.$$
   timeout 60 curl -fsSL -m 50 -o "$tmp.src" "$url" &&
     timeout 60 ffmpeg -nostdin -loglevel error -y -i "$tmp.src" -frames:v 1 -q:v 5 \
       -vf 'scale=96:96:force_original_aspect_ratio=increase,crop=96:96' "$tmp.jpg" &&
-    base64 "$tmp.jpg" | tr -d '\n' >"$tmp" && mv -f "$tmp" "$JOBS/$1.thumb"
+    base64 "$tmp.jpg" | tr -d '\n' >"$tmp" && mv -f "$tmp" "$1"
   rm -f "$tmp" "$tmp.src" "$tmp.jpg"
+}
+
+# ---- Choosing the quality: what "🎚 Choose the quality" finds out, in .logs/.choice/ ----
+# link     what's being chosen for
+# from     share (it came from the share sheet: a notification, then close) or menu
+# rows     the qualities, from formats.py; done or failed once it's known which
+# info     what yt-dlp found (-J), which the download then starts from
+# video    the video picked, while the sound is being picked
+CHOICE=$JOBS/.choice
+FORMATS=${DL_FORMATS:-/usr/local/share/dl/formats.py}
+
+choose() {  # choose <link> <share|menu>: start choosing the quality for a link
+  probe_pid=$(cat "$CHOICE/pid" 2>/dev/null)
+  [ -n "$probe_pid" ] && kill -TERM -"$probe_pid" 2>/dev/null
+  rm -rf "$CHOICE"
+  mkdir -p "$CHOICE"
+  printf '%s\n' "$1" >"$CHOICE/link"
+  echo "$2" >"$CHOICE/from"
+}
+
+probe_start() {  # find the qualities in the background; it can take a minute on YouTube
+  [ -e "$CHOICE/pid" ] && return 0
+  $(command -v setsid) nohup sh "$0" --probe >/dev/null 2>&1 </dev/null &
+  echo $! >"$CHOICE/pid"
+}
+
+probe() {  # dl --probe: what probe_start runs
+  keep_awake
+  link=$(cat "$CHOICE/link")
+  # --flat-playlist: a playlist is listed, not each of its videos found.
+  if yt-dlp -v --no-playlist --flat-playlist $(js_runtime) -J "$link" >"$CHOICE/info.new" 2>"$CHOICE/log" &&
+      python3 "$FORMATS" "$CHOICE/info.new" >"$CHOICE/rows.new" 2>>"$CHOICE/log" &&
+      [ "$(cat "$CHOICE/link" 2>/dev/null)" = "$link" ]; then  # and not replaced meanwhile
+    mv -f "$CHOICE/info.new" "$CHOICE/info"
+    mv -f "$CHOICE/rows.new" "$CHOICE/rows"
+    thumb_to "$CHOICE/thumb" "$(choice_field thumbnail)"
+    : >"$CHOICE/done"
+  elif [ -d "$CHOICE" ]; then
+    : >"$CHOICE/failed"
+  fi
+  rest_unless_busy
+}
+
+probe_wait() {  # probe_wait <seconds>: until the qualities are known, or that long
+  waited=0
+  while [ ! -e "$CHOICE/done" ] && [ ! -e "$CHOICE/failed" ] && [ $waited -lt "$1" ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+}
+
+choice_field() {  # choice_field <title|thumbnail|playlist>: from the rows
+  awk -F '\037' -v k="$1" '$1 == k { print $2; exit }' "$CHOICE/rows" 2>/dev/null
+}
+
+# chosen <format> [audio]: the quality is picked: start the download, and end the choice.
+# Fails after an answer for the Shortcut (from the share sheet: a notification, then close).
+chosen() {
+  link=$(cat "$CHOICE/link")
+  from=$(cat "$CHOICE/from")
+  last=$(ids | head -n 1)
+  new=$((${last:-0} + 1))
+  # If the format picked is gone by the time it's resumed (hours later, say), the best for
+  # iPhone will do.
+  printf '%s/%s\n%s\n' "$1" "$(rule_format iphone)" "$2" >"$JOBS/$new.fmt"
+  # What yt-dlp found goes with it, so it needn't look again; not for a playlist, though,
+  # where it only listed the videos.
+  if [ -e "$CHOICE/done" ] && [ -z "$(choice_field playlist)" ]; then
+    mv -f "$CHOICE/info" "$JOBS/$new.info.json" 2>/dev/null
+  fi
+  mv -f "$CHOICE/thumb" "$JOBS/$new.thumb" 2>/dev/null
+  title=$(choice_field title)
+  start "$link" "$new"
+  rm -rf "$CHOICE"
+  finish "Started: ${title:-$(link_name "$link")}"
+}
+
+# finish <message>: a choice made: from the share sheet, a notification and close; from the
+# menu, the list with the message on it. Fails after an answer for the Shortcut.
+finish() {
+  if [ "$from" = share ]; then
+    echo "@@notify:$1"
+    return 1
+  fi
+  notice "$1"
+  screen=list
+  return 0
 }
 
 segment() { # segment <id>: the log since the download's latest (re)start
@@ -502,12 +645,41 @@ add() {  # add <link>: start it, or resume it if it's already in the list
   echo "Started: $(link_name "$1")"
 }
 
-add_links() {
+links_in() {  # links_in <text>: the links in it, one a line
   # Drop punctuation that ends a sentence rather than the link ("see https://x.com/a.zip.").
   # YouTube's share links carry a "si=" tracking tag that differs on every share; drop it,
   # so sharing the same video twice is the same download.
-  links=$(printf '%s\n' "$1" | grep -oE "$LINK_RE" | sed 's/[.,;:!?]*$//' |
-    sed -E '/^https?:\/\/([a-z]+\.)?(youtube\.com|youtu\.be)\//{s/([?&])si=[^&]*&?/\1/; s/[?&]$//;}')
+  printf '%s\n' "$1" | grep -oE "$LINK_RE" | sed 's/[.,;:!?]*$//' |
+    sed -E '/^https?:\/\/([a-z]+\.)?(youtube\.com|youtu\.be)\//{s/([?&])si=[^&]*&?/\1/; s/[?&]$//;}'
+}
+
+# incoming <text> <share|menu>: links shared to the Shortcut, or pasted in its menu (level
+# 4). One link to a video page asks how to download it: quickly, by the rule in Settings,
+# or in a quality picked from a list. Unless Settings says not to ask; and anything else
+# starts at once. Fails after an answer for the Shortcut.
+incoming() {
+  from=$2
+  link=$(links_in "$1")
+  if [ ! -e "$JOBS/.no-ask" ] && [ -z "$(find "$JOBS" -maxdepth 1 -name .bark-next -mmin -5 2>/dev/null)" ] &&
+      [ -n "$link" ] && [ "$(printf '%s\n' "$link" | wc -l)" = 1 ] && page "$link"; then
+    choose "$link" "$from"
+    screen=choose
+    return 0
+  fi
+  finish "$(add_links "$1")"
+}
+
+page() {  # page <link>: is it a page, which may have a video in it, rather than a file?
+  is_video_site "$1" && return 0
+  case $1 in "$BARK"/* | magnet:* | *ftp:*) return 1 ;; esac
+  end=${1%%[?#]*}
+  end=${end%/}
+  end=${end##*/}
+  case $end in *.htm | *.html | *.php | *.asp | *.aspx) return 0 ;; *.*) return 1 ;; esac
+}
+
+add_links() {
+  links=$(links_in "$1")
   # "3️⃣ Then tap here" on the notifications screen sends the clipboard here, expecting a
   # link from Bark. Anything else on the clipboard then isn't meant to be downloaded.
   if [ -n "$(find "$JOBS" -maxdepth 1 -name .bark-next -mmin -5 2>/dev/null)" ] &&
@@ -681,6 +853,11 @@ act() {  # act <chosen menu line>
 #   @@web:<link>    shows the page in a Safari sheet: the live view, or the player
 #   @@copy:<text>   copies the text
 #   @@share:<text>  shares the text
+# and, from level 4:
+#   @@notify:<text> shows a notification, and closes
+# A shortcut of level 4 also sends what was shared to it as "@@add:<text>", and the link on
+# the clipboard (after @@clipboard) as "@@paste:<text>", instead of running dl -b itself,
+# so that a video can ask how to download it (see incoming).
 # Anything else is a screen of rows: vCards, which Choose from List shows as contacts, each
 # with a picture, a title and a line under it (the "vCard menu" trick, as in Cherri's
 # chooseFromVCard), or plain lines when pictures are off. What comes back is what the row
@@ -709,6 +886,8 @@ ui() {  # ui <what was tapped>
   case $SHORTCUT in [0-9]*-*) LEVEL=${SHORTCUT%%-*} ;; esac
   case $1 in
     @@start) screen=main; opening || return 0 ;;
+    @@add:*) incoming "${1#@@add:}" share || return 0 ;;    # shared to the Shortcut
+    @@paste:*) incoming "${1#@@paste:}" menu || return 0 ;;  # ➕, from the clipboard
     '') ;;
     *) tapped "$(row_key "$1")" || return 0 ;;
   esac
@@ -726,6 +905,10 @@ ui() {  # ui <what was tapped>
     list) list_screen ;;
     item\ *) item_screen "${screen#item }" ;;
     confirm\ *) confirm_screen "${screen#confirm }" ;;
+    choose) choose_screen ;;
+    pick) pick_screen ;;
+    sound) sound_screen ;;
+    quality) quality_screen ;;
     settings) settings_screen ;;
     notifications) notifications_screen ;;
     *) main_screen ;;
@@ -749,7 +932,8 @@ render() {
       n = split("⬅️ back 📥 downloads ⬇️ downloads ➕ add 📂 folder 📦 folder ⚙️ settings 🆕 new " \
         "🔔 bell 🔕 belloff ⬆️ update 🔧 tools 📲 app ⏸ pause ▶️ play ⏹ stop 🔁 retry " \
         "🔄 refresh 🗑 trash ℹ️ info ✅ done ⚠️ failed 🧹 clear 🖼 pictures ⏳ prep0 " \
-        "1️⃣ appstore 2️⃣ copy 3️⃣ paste 📊 live 📤 share 🔗 copy ➖ remove 🐞 bug", w, " ")
+        "1️⃣ appstore 2️⃣ copy 3️⃣ paste 📊 live 📤 share 🔗 copy ➖ remove 🐞 bug " \
+        "🎬 video 🎵 music ⚡ bolt 🎚 sliders 🔇 mute ⚪ unchecked 📃 playlist", w, " ")
       for (i = 1; i < n; i += 2) pic[w[i]] = w[i + 1]
       printf "" > menu
     }
@@ -835,6 +1019,39 @@ tapped() {  # tapped <key>: act on the row tapped. Fails after printing an answe
     copy) load "$id"; copy_text "$link" || return 1 ;;
     share) load "$id"; echo "@@share:$link"; return 1 ;;
     delete) screen="confirm $id" ;;
+    # Choosing how to download a video (see choose)
+    quick) chosen "$(rule_format | sed -n 1p)" "$(rule_format | sed -n 2p)" || return 1 ;;
+    audio-quick) chosen "$(rule_format audio | sed -n 1p)" audio || return 1 ;;
+    rule:*)
+      chosen "$(rule_format "${1#rule:}" | sed -n 1p)" "$(rule_format "${1#rule:}" | sed -n 2p)" || return 1 ;;
+    pick)
+      probe_start
+      probe_wait 80  # the Shortcut waits up to 120 s for this one
+      screen=pick ;;
+    v:*)
+      spec=${1#v:}
+      if [ "${spec##*:}" = 1 ]; then  # it has its own sound
+        chosen "${spec%:*}" || return 1
+      else
+        echo "${spec%:*}" >"$CHOICE/video"
+        screen=sound
+      fi ;;
+    a-only) echo none >"$CHOICE/video"; screen=sound ;;
+    a:*)
+      video=$(cat "$CHOICE/video" 2>/dev/null)
+      case ${1#a:}:$video in
+        none:*) chosen "$video" || return 1 ;;              # no sound
+        *:none) chosen "${1#a:}" audio || return 1 ;;       # sound only
+        *) chosen "$video+${1#a:}" || return 1 ;;
+      esac ;;
+    cancel)
+      from=$(cat "$CHOICE/from" 2>/dev/null)
+      rm -rf "$CHOICE"
+      if [ "$from" = share ]; then echo @@exit; return 1; fi
+      screen=main ;;
+    quality) screen=quality ;;
+    rule-set:*) echo "${1#rule-set:}" >"$JOBS/.quality" ;;
+    ask) flip .no-ask ;;
     delete-yes) notice "$(delete_download "$id")"; screen=list ;;
     report) report_answer || return 1 ;;
     report:*) report_answer "${1#report:}" || return 1 ;;
@@ -1049,6 +1266,84 @@ item_screen() {  # item_screen <id>
   fi
 }
 
+# How to download a video: quickly, by the rule, or in a quality picked from a list.
+choose_screen() {
+  link=$(cat "$CHOICE/link" 2>/dev/null)
+  if [ -z "$link" ]; then  # nothing being chosen any more
+    echo main >"$JOBS/.screen"
+    main_screen
+    return
+  fi
+  row cancel ⬅️ Cancel
+  title=$(choice_field title)
+  pic=
+  [ -s "$CHOICE/thumb" ] && pic=$CHOICE/thumb
+  row self 🎬 "${title:-$(link_name "$link")}" "$(host_of "$link")" "$pic"
+  row quick ⚡ "Quick download" "$(rule_label) · $(rule_detail)"
+  row pick 🎚 "Choose the quality" "Pick the video and the sound"
+  [ "$(cat "$JOBS/.quality" 2>/dev/null)" = audio ] || row audio-quick 🎵 "Audio only" "Just the sound, as M4A"
+}
+
+pick_screen() {  # the qualities yt-dlp found
+  row back:choose ⬅️ Back
+  if [ -e "$CHOICE/failed" ]; then
+    row notice ⚠️ "Couldn't find the qualities" "$(sed -n 's/^ERROR: //p' "$CHOICE/log" | tail -n 1)"
+    row quick ⚡ "Quick download instead" "$(rule_label) · $(rule_detail)"
+    return
+  elif [ ! -e "$CHOICE/done" ]; then
+    row pick ⏳ "Still finding the qualities…" "Tap to wait a little longer"
+    row quick ⚡ "Quick download instead" "$(rule_label) · $(rule_detail)"
+    return
+  fi
+  pic=
+  [ -s "$CHOICE/thumb" ] && pic=$CHOICE/thumb
+  count=$(choice_field playlist)
+  if [ -n "$count" ]; then  # a playlist: one quality for all its videos
+    row self 📃 "$(choice_field title)" "$count videos: pick a quality for all of them" "$pic"
+    for rule in iphone best 720 480 audio; do
+      if [ $rule = audio ]; then e=🎵; else e=🎬; fi
+      row "rule:$rule" $e "$(rule_label $rule)" "$(rule_detail $rule)"
+    done
+    return
+  fi
+  row self 🎬 "$(choice_field title)" "Pick the video's quality" "$pic"
+  awk -F '\037' '$1 == "video"' "$CHOICE/rows" | while IFS=$(printf '\037') read -r kind spec label detail own; do
+    row "v:$spec:$own" 🎬 "$label" "$detail"
+  done
+  grep -q "^audio$(printf '\037')" "$CHOICE/rows" && row a-only 🎵 "Audio only" "Pick the sound next"
+}
+
+sound_screen() {  # the sounds, once a video is picked (or none, for sound only)
+  row back:pick ⬅️ Back
+  video=$(cat "$CHOICE/video" 2>/dev/null)
+  pic=
+  [ -s "$CHOICE/thumb" ] && pic=$CHOICE/thumb
+  if [ "$video" = none ]; then
+    row self 🎵 "$(choice_field title)" "Pick the sound's quality" "$pic"
+  else
+    row self 🎬 "$(choice_field title)" "Pick the sound to go with it" "$pic"
+  fi
+  awk -F '\037' '$1 == "audio"' "$CHOICE/rows" | while IFS=$(printf '\037') read -r kind spec label detail; do
+    row "a:$spec" 🎵 "$label" "$detail"
+  done
+  [ "$video" = none ] || row a:none 🔇 "No sound" "Just the video"
+}
+
+quality_screen() {  # Settings → Quick download: the rule, and whether to ask
+  row back:settings ⬅️ Back
+  current=$(cat "$JOBS/.quality" 2>/dev/null)
+  for rule in iphone best 720 480 audio; do
+    if [ "$rule" = "${current:-iphone}" ]; then e=✅; else e=⚪; fi
+    row "rule-set:$rule" "$e" "$(rule_label $rule)" "$(rule_detail $rule)"
+  done
+  [ "$LEVEL" -ge 4 ] || return 0
+  if [ -e "$JOBS/.no-ask" ]; then
+    row ask 🎚 "Ask when sharing a video · Off" "It downloads at once, by the rule above"
+  else
+    row ask 🎚 "Ask when sharing a video · On" "Quick download, or choose the quality"
+  fi
+}
+
 confirm_screen() {  # confirm_screen <id>: are you sure you want to delete its file?
   load "$1"
   row notice ⚠️ "Delete $name?" "It goes for good, from Files too"
@@ -1084,6 +1379,7 @@ stop_row() {
 
 settings_screen() {
   row back:main ⬅️ Back
+  row quality ⚡ "Quick download" "$(rule_label) · $(rule_detail)"
   if [ -s "$JOBS/.bark" ]; then
     row notifications 🔔 Notifications "On: one when a download finishes"
   else
@@ -1204,9 +1500,12 @@ again() {  # again <id>: prints what it did, as a title line and a detail line
   load "$1"
   title=${playlist:-$name}
   [ "$state" = running ] && pause "$1"
+  fmt=$(cat "$JOBS/$1.fmt" 2>/dev/null)  # the quality picked for it, if one was
   forget "$1"
   last=$(ids | head -n 1)
-  start "$link" $((${last:-0} + 1))
+  new=$((${last:-0} + 1))
+  [ -z "$fmt" ] || printf '%s\n' "$fmt" >"$JOBS/$new.fmt"
+  start "$link" "$new"
   echo "Downloading it again"
   echo "$title"
 }
@@ -1276,7 +1575,7 @@ report() {
       { if (last != "") { print last; last = "" } print; previous = $0 }
       END { if (last != "") print last }' "$JOBS/$rid.log" | tail -n 300
   fi
-  for log in .update.log .app-update.log .web.log; do
+  for log in .update.log .app-update.log .web.log .choice/log; do
     [ -s "$JOBS/$log" ] || continue
     echo
     echo "== $log"
@@ -1415,7 +1714,9 @@ prune() {
   done
 }
 
-forget() { rm -f "$JOBS/$1.log" "$JOBS/$1.pid" "$JOBS/$1.thumb"; }  # forget <id>: drop it from the list
+forget() {  # forget <id>: drop it from the list
+  rm -f "$JOBS/$1.log" "$JOBS/$1.pid" "$JOBS/$1.thumb" "$JOBS/$1.fmt" "$JOBS/$1.info.json"
+}
 
 # Stop a download for good: delete what it left unfinished. A playlist that finished some
 # videos keeps them, moved to Files like any download, and stays on the list as stopped;
@@ -1471,6 +1772,7 @@ case $1 in
   --awake) keep_awake ;;           # while the live view is open
   --rest) rest_unless_busy ;;      # when it closes
   --report) report "$2" ;;         # a debug report (see report)
+  --probe) probe ;;                # the qualities of a video (see choose)
   --update)
     keep_awake
     case $2 in tools | app) update_now "$2" ;; *) update_now tools; update_now app ;; esac

@@ -18,6 +18,7 @@ Both run in Alpine Linux inside the [iSH-AOK](https://github.com/emkey1/ish-AOK)
 | `dl` | the script that runs inside iSH-AOK. It picks yt-dlp or aria2 for each link, downloads in the background, lists downloads with progress bars, pauses and resumes them, and updates itself and its tools |
 | `shortcuts/setup-on-phone.sh` | sets everything up on the phone, and is what updates install: the tools, `dl`, location access, and the signed shortcut |
 | `build_shortcuts.py` | writes `shortcuts/aria2.shortcut` (unsigned), `shortcuts/setup-on-phone.sh` and `icons/` |
+| `formats.py` | turns `yt-dlp`'s list of a video's formats into the qualities to pick from |
 | `web.py` | the live view and the player: a small web server, started by `dl` when they're opened |
 | `icons.py`, `icons/` | draws the menus' pictures (Python's standard library only); `icons/` has them as PNGs to look at |
 | `test.sh` | checks `dl` on a computer, using BusyBox tools like the phone does (needs `aria2c`, `yt-dlp`, `busybox`, `curl`, `ffmpeg` and `python3`) |
@@ -46,7 +47,11 @@ Both run in Alpine Linux inside the [iSH-AOK](https://github.com/emkey1/ish-AOK)
 
 ## Using the "aria2" shortcut
 
-- **Share a link** to it (from Safari, YouTube, Instagram, X or any app's Share button). It starts downloading in the background and shows a notification.
+- **Share a link** to it (from Safari, YouTube, Instagram, X or any app's Share button). A file starts downloading in the background at once, with a notification. A video asks how to download it:
+  - **⚡ Quick download:** right away, in the quality set in **⚙️ Settings → ⚡ Quick download**.
+  - **🎚 Choose the quality:** aria2 asks the site what it has (about a minute for YouTube, a few seconds elsewhere), then lists the video qualities (`1080p · H.264 · 114 MB · plays everywhere`), then the sounds (`AAC · 130 kbps`). Pick one of each, or **🎵 Audio only**, or **🔇 No sound**. For a playlist, you pick one quality for all its videos.
+  - **🎵 Audio only:** just the sound, as M4A.
+  The download then starts from what aria2 already found, so YouTube doesn't take another minute. **➕ Add link from clipboard** asks the same way.
 - **Run it on its own** (Home Screen, Shortcuts app or Siri) for its menu. Each row has a picture and a line under its title:
 
 ```
@@ -92,6 +97,7 @@ It's a small web server in iSH-AOK (`web.py`), on 127.0.0.1 only and with a new 
 
 ```
 ⬅️ Back
+⚡ Quick download         Best for iPhone · H.264 up to 1080p: plays everywhere
 🔔 Notifications          On: one when a download finishes
 ⬆️ aria2 and its shortcut  Up to date · checked 2 h ago
 🔧 Tools: yt-dlp, aria2, ffmpeg  Updated 5 h ago · yt-dlp 2026.10.21
@@ -99,6 +105,8 @@ It's a small web server in iSH-AOK (`web.py`), on 127.0.0.1 only and with a new 
 🖼 Pictures in menus      On
 📲 Open iSH-AOK           The terminal behind aria2
 ```
+
+**⚡ Quick download** picks the rule quick downloads use: **Best for iPhone** (H.264 up to 1080p, which plays everywhere; the default), **Best quality** (up to 4K, VP9 or AV1, which may not play in Files), **720p**, **480p** or **Audio only**. It also has **🎚 Ask when sharing a video**: turn it off to have shared videos start at once, the quick way.
 
 All of these screens come from `dl` itself; the shortcut only shows them. So new menus arrive with `dl`'s updates, without importing a new shortcut. With **🖼 Pictures in menus** off, they're plain lines of text.
 
@@ -170,6 +178,7 @@ From this folder: `sh test.sh`
 
 ## Limits
 
+- **Choosing the quality waits** while aria2 asks the site, up to 80 seconds, with the shortcut showing that it's running. If it isn't done by then, tap **⏳ Still finding the qualities…** to wait some more.
 - **YouTube is slow to start.** Every YouTube video's download address is scrambled, and only YouTube's own player JavaScript (several MB, deliberately obfuscated) can unscramble it. yt-dlp runs that for every video inside iSH-AOK's Linux emulation, which shows as "Solving JS challenges". With Node it takes about 40 seconds on an iPhone; with QuickJS, about 2½ minutes. Each video in a playlist pays it again.
 - **Background:** iOS may still pause location updates when the phone sits still for a long time, and then the download waits until iSH-AOK is opened. A single Run Command can last 120 seconds at most, which is why `dl` starts every download in the background and returns at once.
 - **Instagram** often refuses downloads without a login, and Instagram stories always need one. yt-dlp can use cookies from a logged-in browser, but `dl` doesn't pass any yet.

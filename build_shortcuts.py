@@ -4,7 +4,7 @@
 Writes into shortcuts/:
   aria2.shortcut      unsigned; to use it directly, sign it on a Mac:
                       shortcuts sign -m anyone -i aria2.shortcut -o "aria2 (signed).shortcut"
-  setup-on-phone.sh   run in iSH-AOK: installs aria2, yt-dlp, dl, its pictures and web.py, asks for
+  setup-on-phone.sh   run in iSH-AOK: installs aria2, yt-dlp, dl, its pictures, web.py and formats.py, asks for
                       location access, then signs the shortcut with RoutineHub's HubSign
                       service into /root/Shortcuts, and into the Files folder at /mnt/phone
 and the pictures for dl's menus into icons/ (drawn by icons.py).
@@ -43,7 +43,9 @@ TEAL, DOWNLOAD_GLYPH = 431817727, 59693
 # What this shortcut can do, which dl reads from its version ("<level>-<hash>"). Raise it
 # whenever the shortcut learns an answer from dl that older ones don't know (see dl -ui).
 # Level 3: @@web:, @@copy: and @@share:. (c1a2b4d4 was level 2; it had no level in its version.)
-LEVEL = 3
+# Level 4: @@notify:; it sends what's shared as @@add: and the clipboard as @@paste:, and
+# gives dl -ui 120 s.
+LEVEL = 4
 # If conditions, as numbered by the Shortcuts app.
 BEGINS_WITH, HAS_ANY_VALUE = 8, 100
 # Control flow: the opening action of a block, its "Otherwise", and its "End".
@@ -117,23 +119,20 @@ def chain(value, branches, otherwise):
             *chain(value, rest, otherwise), control("conditional", group, END)]
 
 
-def run_command(*command):
+def run_command(*command, timeout=None):
+    """iSH-AOK's Run Command. Its timeout is 20 s unless given (at most 120)."""
+    params = {"timeout": timeout} if timeout else {}
     return action("app.ish.iSH-AOK.ISHRunCommandIntent",
                   AppIntentDescriptor={**ISH_AOK, "AppIntentIdentifier": "ISHRunCommandIntent"},
-                  command=text(*command))
+                  command=text(*command), **params)
 
 
-def run_with_base64(command, variable, after=""):
+def run_with_base64(command, variable, after="", timeout=None):
     """Run `<command> '<variable, base64-encoded>'<after>`, so nothing in it can act as shell syntax."""
     as_text = action("gettext", WFTextActionText=text(variable))
     encoded = action("base64encode", WFEncodeMode="Encode", WFInput=attachment(output_of(as_text, "Text")))
-    run = run_command(f"{command} '", output_of(encoded, "Base64 Encoded"), "'" + after)
+    run = run_command(f"{command} '", output_of(encoded, "Base64 Encoded"), "'" + after, timeout=timeout)
     return [as_text, encoded, run], run
-
-
-def notify(run):
-    return action("notification", WFNotificationActionTitle="aria2",
-                  WFNotificationActionBody=text(output_of(run, "Run Command")))
 
 
 def open_ish_aok():
@@ -158,21 +157,21 @@ def aria2(version):
     """The shortcut. It tells dl its version, so dl knows which answers and screens it takes."""
     acts = []
 
-    # Shared from another app: start the download and say so. It carries on in the
-    # background as long as iSH-AOK may use location Always (see keep_awake in dl).
-    shared = new_uuid()
-    start, run = run_with_base64("dl -b", SHORTCUT_INPUT)
-    acts += [if_(shared, SHORTCUT_INPUT, HAS_ANY_VALUE), *start, notify(run),
-             action("exit"), control("conditional", shared, END)]
-
-    # Opened on its own: dl's screens (see `dl -ui`), one after another until it's closed.
-    # Each time round, dl gets what was tapped last ("@@start" the first time) and this
-    # shortcut's version, and prints the next screen, or an answer only the Shortcut can
-    # carry out.
+    # dl's screens (see `dl -ui`), one after another until it's closed. Each time round, dl
+    # gets what was tapped last and this shortcut's version, and prints the next screen, or
+    # an answer only the Shortcut can carry out. The first time, that's "@@start", or what
+    # was shared from another app as "@@add:<it>": dl then either starts it (and answers
+    # with a notification, and close) or asks how to download a video. Downloads carry on
+    # in the background as long as iSH-AOK may use location Always (see keep_awake in dl).
     start_text = action("gettext", WFTextActionText=text("@@start"))
     acts += [start_text, set_variable("tapped", output_of(start_text, "Text"))]
+    shared = new_uuid()
+    add_text = action("gettext", WFTextActionText=text("@@add:", SHORTCUT_INPUT))
+    acts += [if_(shared, SHORTCUT_INPUT, HAS_ANY_VALUE), add_text, set_variable("tapped", output_of(add_text, "Text")),
+             control("conditional", shared, END)]
     loop = new_uuid()
-    ui, run = run_with_base64("dl -ui -b", variable("tapped"), f" -k {version}")
+    # 120 s, the most iSH-AOK allows: finding a YouTube video's qualities takes about a minute.
+    ui, run = run_with_base64("dl -ui -b", variable("tapped"), f" -k {version}", timeout=120)
     answer = output_of(run, "Run Command")
     acts += [control("repeat.count", loop, START, WFRepeatCount=500), *ui]
 
@@ -209,8 +208,12 @@ def aria2(version):
     def without(prefix):  # the answer after its "@@…:"
         return action("text.replace", WFInput=text(answer), WFReplaceTextFind=prefix, WFReplaceTextReplace="")
 
+    # @@clipboard: dl gets the clipboard as "@@paste:<it>", and asks about a video as it
+    # would about a shared one.
     clipboard = action("getclipboard")
-    from_clipboard, added = run_with_base64("dl -b", output_of(clipboard, "Clipboard"))
+    pasted = action("gettext", WFTextActionText=text("@@paste:", output_of(clipboard, "Clipboard")))
+    # @@notify:<text>: a notification, then close.
+    notice = without("@@notify:")
     # @@web:<link>: the live view or the player, in a Safari sheet. The loop carries on
     # once it's closed.
     page = without("@@web:")
@@ -225,7 +228,10 @@ def aria2(version):
     choose = action("choosefromlist", WFInput=attachment(output_of(lines, "Split Text")),
                     WFChooseFromListActionPrompt=NAME)
     acts += chain(answer, [
-        ("@@clipboard", [clipboard, *from_clipboard, notify(added), *again()]),
+        ("@@clipboard", [clipboard, pasted, set_variable("tapped", output_of(pasted, "Text"))]),
+        ("@@notify:", [notice, action("notification", WFNotificationActionTitle=NAME,
+                                      WFNotificationActionBody=text(output_of(notice, "Updated Text"))),
+                       action("exit")]),
         ("@@web:", [page, action("showwebpage", WFURL=text(output_of(page, "Updated Text"))), *again()]),
         ("@@copy:", [copied, action("setclipboard", WFInput=attachment(output_of(copied, "Updated Text"))), *again()]),
         ("@@share:", [shared, action("share", WFInput=attachment(output_of(shared, "Updated Text"))), *again()]),
@@ -323,6 +329,10 @@ cat >/usr/local/share/dl/web.py.new <<'WEB_PY'
 {web}WEB_PY
 mv -f /usr/local/share/dl/web.py.new /usr/local/share/dl/web.py
 pkill -f /usr/local/share/dl/web.py
+# What turns yt-dlp's list of a video's qualities into dl's menu (Choose the quality).
+cat >/usr/local/share/dl/formats.py.new <<'FORMATS_PY'
+{formats}FORMATS_PY
+mv -f /usr/local/share/dl/formats.py.new /usr/local/share/dl/formats.py
 touch /root/Downloads/.logs/.v2
 # dl's update compares the repository's copy of this script against this hash.
 sha256sum <"$0" | cut -d' ' -f1 >/root/Downloads/.logs/.setup
@@ -423,6 +433,7 @@ if __name__ == "__main__":
     dl = (HERE / "dl").read_text()
     setup = (SETUP.replace("{name}", NAME).replace("{version}", version)
              .replace("{request}", hubsign_request(NAME, plist)))
-    web = (HERE / "web.py").read_text()
-    path.write_text(setup.replace("{icons}", pictures).replace("{dl}", dl).replace("{web}", web))  # last: they're big
+    web, formats = (HERE / "web.py").read_text(), (HERE / "formats.py").read_text()
+    path.write_text(setup.replace("{icons}", pictures).replace("{dl}", dl).replace("{web}", web)
+                    .replace("{formats}", formats))  # last: they're big
     print(path)

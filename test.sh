@@ -71,6 +71,13 @@ done
 for tool in nohup pgrep pkill kill curl ffmpeg python3; do ln -s "$(command -v $tool)" "$tmp/bin/$tool"; done
 # The live view's server, from this folder, on a port of its own.
 export DL_WEB="$here/web.py" DL_WEB_PORT=18781
+# What lists a video's qualities, from this folder too.
+export DL_FORMATS="$here/formats.py"
+printf '<!doctype html><title>Quality test</title><video src="rabbit.mp4"></video>\n' >"$tmp/www/quality.html"
+printf '<!doctype html><title>Audio test</title><video src="rabbit2.mp4"></video>\n' >"$tmp/www/audio.html"
+printf '<!doctype html><title>Second playlist</title><video src="rabbit.mp4"></video><video src="rabbit2.mp4"></video>\n' \
+  >"$tmp/www/list2.html"
+printf 'third\n' >"$tmp/www/note3.txt"
 # The menus' pictures, as setup installs them.
 export DL_ICONS="$tmp/icons"
 mkdir "$DL_ICONS"
@@ -464,6 +471,68 @@ case $out in *GOODKEY42* | *"$token"*) fail "the report gave away a secret" ;; *
 check "...then says so" "$(u3 '')" "N;CHARSET=utf-8:Copied a debug report;;;;"
 check "the live view shows the report, ready to copy" "$(web "/report/$gid?t=$token")" "Copy the report</button>"
 check "...the same report" "$(web "/report/$gid?t=$token")" "== Download #$gid: failed"
+
+# formats.py: a video's qualities, from what yt-dlp -J prints (here, a made-up YouTube-like one).
+rows=$(python3 "$DL_FORMATS" "$here/test-data/youtube-like.json" | tr '\037' '|')
+check "formats.py: one row a resolution, H.264 first" "$rows" "video|137|1080p|H.264 · 114 MB · plays everywhere|0"
+check "...the best of the rest where there's no H.264" "$rows" "video|313|2160p|VP9 · 858 MB · may not play in Files|0"
+check "...a format with its own sound says so" "$rows" "video|18|360p|H.264 · 8.6 MB · plays everywhere|1"
+check "...then the sounds, AAC first" "$(printf '%s\n' "$rows" | grep '^audio' | head -n 1)" "audio|140|AAC · 130 kbps|3.3 MB · plays everywhere"
+case $rows in *140-drc* | *storyboard* | *sb0*) fail "formats.py lists formats nobody wants: $rows" ;;
+  *) ok "...without DRC copies or storyboards" ;; esac
+check "formats.py: a playlist" "$(python3 "$DL_FORMATS" "$here/test-data/playlist.json" | tr '\037' '|')" "playlist|12"
+
+# A shortcut of level 4 asks how to download a shared video: quickly, by the rule in
+# Settings, or in a quality picked from what the site has.
+u4() { dl -ui -b "$(b64 "$1")" -k 4-test; }
+check "level 4: a shared file starts at once, with a notification" "$(u4 "@@add:http://127.0.0.1:$port/note3.txt")" \
+  "@@notify:Started: note3.txt"
+cards=$(u4 "@@add:Look at this: http://127.0.0.1:$port/quality.html")
+check "level 4: a shared video page asks how to download it" "$cards" "N;CHARSET=utf-8:Quick download;;;;
+ORG;CHARSET=utf-8:Best for iPhone · H.264 up to 1080p: plays everywhere;"
+check "...or to choose the quality" "$cards" "N;CHARSET=utf-8:Choose the quality;;;;"
+check "...or to get just its sound" "$cards" "N;CHARSET=utf-8:Audio only;;;;"
+cards=$(u4 'Choose the quality')
+check "Choose the quality lists what the site has" "$cards" "N;CHARSET=utf-8:mp4;;;;
+ORG;CHARSET=utf-8:plays everywhere;"
+check "...under the video's title" "$cards" "N;CHARSET=utf-8:Quality test (1);;;;"
+qid=$(($(ls "$DL_DIR/.logs" | sed -n 's/^\([0-9]*\)\.log$/\1/p' | sort -n | tail -n 1) + 1))
+check "picking one starts it, then closes with a notification" "$(u4 mp4)" "@@notify:Started: Quality test (1)"
+case $(sed -n 1p "$DL_DIR/.logs/$qid.fmt" 2>/dev/null) in 0/*) ok "...in the format picked" ;; *) false ;; esac || fail "no format kept for #$qid"
+for try in $(seq 20); do grep -q 'Command-line config' "$DL_DIR/.logs/$qid.log" 2>/dev/null && break; sleep 1; done
+check "...from what yt-dlp already found, without finding it again" "$(log_of $qid)" "'--load-info-json', '$DL_DIR/.logs/$qid.info.json'"
+
+cards=$(u4 "@@paste:http://127.0.0.1:$port/audio.html")
+check "level 4: a pasted video page asks too" "$cards" "N;CHARSET=utf-8:Audio only;;;;"
+aud=$(($(ls "$DL_DIR/.logs" | sed -n 's/^\([0-9]*\)\.log$/\1/p' | sort -n | tail -n 1) + 1))
+check "Audio only, from the menu, goes back to the list" "$(u4 'Audio only')" "N;CHARSET=utf-8:Started: audio.html;;;;"
+[ "$(sed -n 2p "$DL_DIR/.logs/$aud.fmt" 2>/dev/null)" = audio ] && ok "...for the sound only" || fail "no audio format for #$aud"
+for try in $(seq 20); do grep -q 'Command-line config' "$DL_DIR/.logs/$aud.log" 2>/dev/null && break; sleep 1; done
+check "...made into M4A" "$(log_of $aud)" "'-x', '--audio-format', 'm4a'"
+
+cards=$(u4 "@@add:http://127.0.0.1:$port/list2.html")
+cards=$(u4 'Choose the quality')
+check "level 4: a playlist offers one quality for all its videos" "$cards" "N;CHARSET=utf-8:Second playlist;;;;
+ORG;CHARSET=utf-8:2 videos: pick a quality for all of them;"
+check "...from the rules" "$cards" "N;CHARSET=utf-8:480p;;;;"
+check "...and Back goes back" "$(u4 Back)" "N;CHARSET=utf-8:Choose the quality;;;;"
+[ "$(u4 Cancel)" = @@exit ] && ok "Cancel, from the share sheet, closes" || fail "Cancel didn't close"
+[ ! -e "$DL_DIR/.logs/.choice" ] && ok "...and forgets the choice" || fail ".choice is still there"
+
+u4 @@start >/dev/null
+u4 Settings >/dev/null
+cards=$(u4 'Quick download')
+check "Settings: the quick download's rules" "$cards" "N;CHARSET=utf-8:Best for iPhone;;;;
+ORG;CHARSET=utf-8:H.264 up to 1080p: plays everywhere;"
+check "...the one in use is ticked" "$cards" "PHOTO;ENCODING=b:$(cat "$DL_ICONS/done.b64")"
+cards=$(u4 720p)
+[ "$(cat "$DL_DIR/.logs/.quality")" = 720 ] && ok "...picking another uses it" || fail "the rule wasn't set"
+cards=$(u4 'Ask when sharing a video · On')
+check "...and asking can be turned off" "$cards" "N;CHARSET=utf-8:Ask when sharing a video · Off;;;;"
+check "then a shared video starts at once" "$(u4 "@@add:http://127.0.0.1:$port/text.html?again")" "@@notify:Started: "
+u4 'Ask when sharing a video · Off' >/dev/null
+u4 'Best for iPhone' >/dev/null
+[ ! -e "$DL_DIR/.logs/.no-ask" ] && [ "$(cat "$DL_DIR/.logs/.quality")" = iphone ] && ok "...and back" || fail "settings not restored"
 
 # Notifications, through the stand-in for Bark's server.
 [ ! -e "$tmp/bark.log" ] && ok "no notifications before they're turned on" ||
