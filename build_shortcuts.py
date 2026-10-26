@@ -4,7 +4,7 @@
 Writes into shortcuts/:
   aria2.shortcut      unsigned; to use it directly, sign it on a Mac:
                       shortcuts sign -m anyone -i aria2.shortcut -o "aria2 (signed).shortcut"
-  setup-on-phone.sh   run in iSH-AOK: installs aria2, yt-dlp, dl and its pictures, asks for
+  setup-on-phone.sh   run in iSH-AOK: installs aria2, yt-dlp, dl, its pictures and web.py, asks for
                       location access, then signs the shortcut with RoutineHub's HubSign
                       service into /root/Shortcuts, and into the Files folder at /mnt/phone
 and the pictures for dl's menus into icons/ (drawn by icons.py).
@@ -40,6 +40,10 @@ SHORTCUT_INPUT = {"Type": "ExtensionInput"}
 
 # Icon colour and glyph, as numbered by the Shortcuts app.
 TEAL, DOWNLOAD_GLYPH = 431817727, 59693
+# What this shortcut can do, which dl reads from its version ("<level>-<hash>"). Raise it
+# whenever the shortcut learns an answer from dl that older ones don't know (see dl -ui).
+# Level 3: @@web:, @@copy: and @@share:. (c1a2b4d4 was level 2; it had no level in its version.)
+LEVEL = 3
 # If conditions, as numbered by the Shortcuts app.
 BEGINS_WITH, HAS_ANY_VALUE = 8, 100
 # Control flow: the opening action of a block, its "Otherwise", and its "End".
@@ -100,6 +104,17 @@ def if_(group, variable, condition, value=None):
     if value is not None:
         params["WFConditionalActionString"] = value
     return control("conditional", group, START, **params)
+
+
+def chain(value, branches, otherwise):
+    """If value begins with the first branch's prefix, that branch's actions; otherwise the
+    next branch's, and so on; and if none, `otherwise`."""
+    if not branches:
+        return otherwise
+    (prefix, then), rest = branches[0], branches[1:]
+    group = new_uuid()
+    return [if_(group, value, BEGINS_WITH, prefix), *then, control("conditional", group, MIDDLE),
+            *chain(value, rest, otherwise), control("conditional", group, END)]
 
 
 def run_command(*command):
@@ -187,10 +202,19 @@ def aria2(version):
     # @@clipboard: add the copied link. Anything else is a screen to choose from: vCards,
     # which, saved as a .vcf and read as contacts, show as rows with a picture and a line
     # under the title (the trick Cherri's chooseFromVCard uses), or plain lines.
-    clipboard_add, cards = new_uuid(), new_uuid()
+    def again():  # then dl shows the same screen again
+        nothing = action("gettext", WFTextActionText=text(""))
+        return [nothing, set_variable("tapped", output_of(nothing, "Text"))]
+
+    def without(prefix):  # the answer after its "@@…:"
+        return action("text.replace", WFInput=text(answer), WFReplaceTextFind=prefix, WFReplaceTextReplace="")
+
     clipboard = action("getclipboard")
     from_clipboard, added = run_with_base64("dl -b", output_of(clipboard, "Clipboard"))
-    nothing = action("gettext", WFTextActionText=text(""))  # then dl shows the same screen again
+    # @@web:<link>: the live view or the player, in a Safari sheet. The loop carries on
+    # once it's closed.
+    page = without("@@web:")
+    copied, shared = without("@@copy:"), without("@@share:")
     vcards = action("gettext", WFTextActionText=text(answer))
     menu = action("setitemname", WFInput=attachment(output_of(vcards, "Text")), WFName="menu.vcf")
     pick = action("choosefromlist", WFInput=attachment(as_contacts(output_of(menu, "Renamed Item"))),
@@ -200,16 +224,13 @@ def aria2(version):
     lines = action("text.split", text=text(answer), WFTextSeparator="New Lines")
     choose = action("choosefromlist", WFInput=attachment(output_of(lines, "Split Text")),
                     WFChooseFromListActionPrompt=NAME)
-    acts += [if_(clipboard_add, answer, BEGINS_WITH, "@@clipboard"),
-             clipboard, *from_clipboard, notify(added),
-             nothing, set_variable("tapped", output_of(nothing, "Text")),
-             control("conditional", clipboard_add, MIDDLE),
-             if_(cards, answer, BEGINS_WITH, "BEGIN:VCARD"),
-             vcards, menu, pick, title, set_variable("tapped", output_of(title, "Name")),
-             control("conditional", cards, MIDDLE),
-             lines, choose, set_variable("tapped", output_of(choose, "Chosen Item")),
-             control("conditional", cards, END),
-             control("conditional", clipboard_add, END)]
+    acts += chain(answer, [
+        ("@@clipboard", [clipboard, *from_clipboard, notify(added), *again()]),
+        ("@@web:", [page, action("showwebpage", WFURL=text(output_of(page, "Updated Text"))), *again()]),
+        ("@@copy:", [copied, action("setclipboard", WFInput=attachment(output_of(copied, "Updated Text"))), *again()]),
+        ("@@share:", [shared, action("share", WFInput=attachment(output_of(shared, "Updated Text"))), *again()]),
+        ("BEGIN:VCARD", [vcards, menu, pick, title, set_variable("tapped", output_of(title, "Name"))]),
+    ], [lines, choose, set_variable("tapped", output_of(choose, "Chosen Item"))])
 
     acts.append(control("repeat.count", loop, END))
     return {
@@ -253,10 +274,10 @@ if ! pgrep -f 'dd if=/dev/location' >/dev/null; then
 fi
 
 if [ -z "$DL_APP_ONLY" ] || ! command -v aria2c >/dev/null || ! command -v yt-dlp >/dev/null ||
-    ! command -v ffmpeg >/dev/null; then
+    ! command -v ffmpeg >/dev/null || ! command -v python3 >/dev/null; then
   echo "Installing aria2, yt-dlp, Node and ffmpeg. The first time, this downloads about 150 MB."
-  apk add -q aria2 curl ffmpeg nodejs yt-dlp-ejs-rt-quickjs yt-dlp ||
-    apk add -q aria2 curl ffmpeg nodejs yt-dlp ||
+  apk add -q aria2 curl ffmpeg nodejs python3 yt-dlp-ejs-rt-quickjs yt-dlp ||
+    apk add -q aria2 curl ffmpeg nodejs python3 yt-dlp ||
     echo "Couldn't install everything; carrying on with what's there."
 
   # yt-dlp's own release, next to Alpine's: YouTube changes often, Alpine's package lags
@@ -296,6 +317,12 @@ while read -r icon data; do
   printf '%s' "$data" >"/usr/local/share/dl/icons/$icon.b64"
 done <<'ICONS'
 {icons}ICONS
+# The live view's server, which dl starts when it's asked for. A running one stops now, so
+# that the next one is the new one.
+cat >/usr/local/share/dl/web.py.new <<'WEB_PY'
+{web}WEB_PY
+mv -f /usr/local/share/dl/web.py.new /usr/local/share/dl/web.py
+pkill -f /usr/local/share/dl/web.py
 touch /root/Downloads/.logs/.v2
 # dl's update compares the repository's copy of this script against this hash.
 sha256sum <"$0" | cut -d' ' -f1 >/root/Downloads/.logs/.setup
@@ -379,7 +406,7 @@ if __name__ == "__main__":
     OUT.mkdir(exist_ok=True)
     # The version is a hash of the shortcut built without one, so it changes whenever
     # anything else in the shortcut does.
-    version = hashlib.sha256(binary(build(""))).hexdigest()[:8]
+    version = f"{LEVEL}-" + hashlib.sha256(binary(build(""))).hexdigest()[:8]
     plist = build(version)
     path = OUT / f"{NAME}.shortcut"
     path.write_bytes(binary(plist))
@@ -396,5 +423,6 @@ if __name__ == "__main__":
     dl = (HERE / "dl").read_text()
     setup = (SETUP.replace("{name}", NAME).replace("{version}", version)
              .replace("{request}", hubsign_request(NAME, plist)))
-    path.write_text(setup.replace("{icons}", pictures).replace("{dl}", dl))  # last: they're big
+    web = (HERE / "web.py").read_text()
+    path.write_text(setup.replace("{icons}", pictures).replace("{dl}", dl).replace("{web}", web))  # last: they're big
     print(path)

@@ -60,15 +60,17 @@ http.server.ThreadingHTTPServer(("127.0.0.1", port), handler).serve_forever()
 PY
 python3 -I "$tmp/server.py" $port "$tmp/www" "$tmp/bark.log" >/dev/null 2>&1 &
 server=$!
-trap 'kill $server; pkill -f "$tmp"; pkill -f "$here/dl --work"; rm -rf "$tmp"' EXIT
+trap 'kill $server; pkill -f "$tmp"; pkill -f "$here/dl --work"; pkill -f "$here/web.py"; rm -rf "$tmp"' EXIT
 
 # Alpine's BusyBox has nohup, pgrep and pkill; Ubuntu's doesn't, so those come from the system.
 # aria2c and yt-dlp are slowed down so a download is still running when the checks look at it.
 mkdir "$tmp/bin"
-for tool in busybox sh awk base64 cat cp cut date dd du find grep head ls mkdir mv od rm rmdir sed seq setsid sha256sum sleep sort tail timeout tr wc; do
+for tool in busybox sh awk base64 cat cp cut date dd du find grep head ls mkdir mv od rm rmdir sed seq setsid sha256sum sleep sort stat tail timeout tr wc; do
   ln -s "$(command -v busybox)" "$tmp/bin/$tool"
 done
-for tool in nohup pgrep pkill kill curl ffmpeg; do ln -s "$(command -v $tool)" "$tmp/bin/$tool"; done
+for tool in nohup pgrep pkill kill curl ffmpeg python3; do ln -s "$(command -v $tool)" "$tmp/bin/$tool"; done
+# The live view's server, from this folder, on a port of its own.
+export DL_WEB="$here/web.py" DL_WEB_PORT=18781
 # The menus' pictures, as setup installs them.
 export DL_ICONS="$tmp/icons"
 mkdir "$DL_ICONS"
@@ -280,8 +282,20 @@ finished=$(printf '%s\n' "$screen" | grep -c -E '^(✅|⚠️) ')
   fail "ui: $finished finished downloads listed"
 case $screen in *' #'[0-9]*) fail "ui: the list still shows numbers: $screen" ;; *) ok "ui: no numbers in the list" ;; esac
 check "ui: a finished video, without .mp4" "$screen" "✅ Rabbit test page (1) · Downloaded · "
-check "ui: tapping a finished download opens it in Files" "$(tap '✅ Rabbit test page')" \
+screen=$(tap '✅ Rabbit test page')
+check "ui: tapping a finished download shows what it can do" "$screen" "▶️ Open · In the Files app
+📂 Show in folder · In Files: Share
+🔁 Download again · In case it was moved or deleted
+🔗 Copy link · 127.0.0.1
+➖ Remove from the list · The file stays where it is
+🗑 Delete the file… · Asks first"
+check "ui: ...under the download itself" "$screen" "✅ Rabbit test page (1) · Downloaded · 816.0K · "
+check "ui: Open, for the shortcut before pictures, goes to Files" "$(tap '▶️ Open')" \
   "shareddocuments://$DL_SHARE/Rabbit%20test%20page%20%281%29.mp4"
+[ "$(tap '📂 Show in folder')" = "shareddocuments://$DL_SHARE" ] && ok "ui: Show in folder opens its folder" ||
+  fail "ui: Show in folder: $(tap '📂 Show in folder')"
+check "ui: Copy link, for a shortcut that can't copy, shows it" "$(tap '🔗 Copy link')" "ℹ️ Its link · http://127.0.0.1:$port/video.html"
+screen=$(tap '⬅️ Back')
 for try in $(seq 40); do line_for '#11' | grep -q '% · ' && break; sleep 1; done
 screen=$(ui '')
 screen=$(tap 'Slow page')
@@ -337,9 +351,21 @@ printf 'https://example.com/x\n=== start\n=== via aria2\nFILE: %s/Hello, world; 
   >"$DL_DIR/.logs/50.log"
 cards=$(uik '')
 check "cards: commas and semicolons are escaped" "$cards" 'N;CHARSET=utf-8:Hello\, world\; again.txt;;;;'
-check "cards: and tapping that title finds it" "$(uik 'Hello, world; again.txt')" "N;CHARSET=utf-8:It's in iSH-AOK's own Downloads folder;;;;"
-dl -ui -b "$(b64 '')" -k oldver0 >/dev/null
-rm -f "$DL_DIR/.logs/50.log"
+printf 'hi there\n' >"$DL_DIR/Hello, world; again.txt"
+cards=$(uik 'Hello, world; again.txt')
+check "cards: and tapping that title finds it" "$cards" "N;CHARSET=utf-8:Hello\, world\; again.txt;;;;"
+check "cards: a shortcut with pictures can play what it downloaded" "$cards" "N;CHARSET=utf-8:Open;;;;
+ORG;CHARSET=utf-8:Plays it right here;"
+case $cards in *'Share link'*) fail "cards: level 2 can't share, but was offered it" ;; *) ok "cards: no sharing before level 3" ;; esac
+out=$(uik Open)
+check "cards: Open starts the player, in Safari before level 3" "$out" "@@open:http://127.0.0.1:$DL_WEB_PORT/play/50?t="
+check "...which serves the file, even from iSH-AOK's own folder" "$(curl -sL "${out#@@open:}")" "hi there"
+check "cards: Delete the file asks first" "$(uik 'Delete the file…')" "N;CHARSET=utf-8:Delete Hello\, world\; again.txt?;;;;"
+check "cards: No keeps it" "$(uik 'No, keep it')" "N;CHARSET=utf-8:Delete the file…;;;;"
+uik 'Delete the file…' >/dev/null
+check "cards: Yes deletes it" "$(uik 'Yes, delete it')" "N;CHARSET=utf-8:Deleted Hello\, world\; again.txt;;;;"
+[ ! -e "$DL_DIR/Hello, world; again.txt" ] && [ ! -e "$DL_DIR/.logs/50.log" ] && ok "...the file and its place in the list" ||
+  fail "the deleted file or its log is still there"
 
 # A new shortcut from an update: setup leaves it in Files and says where in .pending.
 printf 'AEA1 pretend signed shortcut' >"$DL_SHORTCUTS/aria2.shortcut"
@@ -357,6 +383,68 @@ out=$(dl -ui -b "$(b64 @@start)" -k newver1)
 case $out in *'New aria2 shortcut'*) fail "the new shortcut is offered to itself" ;;
   *) ok "once the new shortcut runs, it's no longer offered" ;; esac
 [ ! -e "$DL_SHORTCUTS/.pending" ] && ok "...and .pending is gone" || fail ".pending still there"
+
+# A shortcut of level 3 shows pages in a sheet (the live view, the player), and copies and
+# shares links.
+u3() { dl -ui -b "$(b64 "$1")" -k 3-test; }
+AGAIN=http://127.0.0.1:$port/again.txt
+printf 'first\n' >"$tmp/www/again.txt"
+printf 'second\n' >"$tmp/www/note2.txt"
+dl "$AGAIN" >/dev/null
+dl "http://127.0.0.1:$port/rabbit3.mp4" >/dev/null  # about 16 s at 50K/s: something to watch
+for try in $(seq 30); do line_for again.txt | grep -q ✅ && break; sleep 1; done
+u3 @@start >/dev/null
+cards=$(u3 Downloads)
+check "level 3: the list offers the live view while something downloads" "$cards" "N;CHARSET=utf-8:Watch live;;;;"
+out=$(u3 'Watch live')
+check "level 3: the live view opens in a sheet" "$out" "@@web:http://127.0.0.1:$DL_WEB_PORT/?t="
+live=${out#@@web:}
+token=${live#*t=}
+web() { curl -s "http://127.0.0.1:$DL_WEB_PORT$1"; }
+code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
+check "the live view's page" "$(curl -s "$live")" "<title>aria2</title>"
+check "its status says what's downloading" "$(web "/status?t=$token")" '"title": "rabbit3.mp4", "state": "running"'
+[ "$(code "http://127.0.0.1:$DL_WEB_PORT/status")" = 403 ] && ok "...but only with its token" || fail "the live view answered without its token"
+[ "$(code -H 'Host: example.com' "http://127.0.0.1:$DL_WEB_PORT/status?t=$token")" = 403 ] && ok "...and only to 127.0.0.1" ||
+  fail "the live view answered another host name"
+check "the player shows a playlist's videos" "$(web "/play/9?t=$token")" "Rabbit playlist</h1><ul><li><a href=\"/play/9?t=$token&f="
+check "the player plays a video" "$(web "/play/6?t=$token")" "<video src=\"/file/6?t=$token\""
+check "...in ranges, as Safari asks for them" "$(curl -s -D - -o /dev/null -r 100-199 "http://127.0.0.1:$DL_WEB_PORT/file/6?t=$token" | tr -d '\r')" \
+  "Content-Range: bytes 100-199/$(wc -c <"$tmp/www/rabbit.mp4" | tr -d ' ')"
+post() { curl -s -H "X-Token: $token" -H 'Content-Type: application/json' -d "$2" "http://127.0.0.1:$DL_WEB_PORT$1"; }
+rid=$(line_for rabbit3 | sed 's/.*#//')
+check "the live view's Pause button" "$(post /act "{\"id\": $rid, \"do\": \"pause\"}")" '"message": "Paused rabbit3.mp4"'
+check "...pauses it" "$(line_for rabbit3)" " · paused  #$rid"
+check "its Resume button" "$(post /act "{\"id\": $rid, \"do\": \"resume\"}")" '"message": "Resumed rabbit3.mp4"'
+check "pasting a link into it" "$(post /add "{\"text\": \"http://127.0.0.1:$port/note2.txt\"}")" '"message": "Started: note2.txt"'
+
+cards=$(u3 'again.txt')
+check "level 3: a finished download can share its link" "$cards" "N;CHARSET=utf-8:Share link;;;;"
+aid=$(line_for again.txt | sed 's/.*#//')
+out=$(u3 Open)
+check "level 3: Open plays it in a sheet" "$out" "@@web:http://127.0.0.1:$DL_WEB_PORT/play/$aid?t=$token"
+[ "$(code "${out#@@web:}")" = 303 ] && ok "a text file opens as itself" || fail "the player didn't hand over the text file"
+check "...from Files" "$(curl -sL "${out#@@web:}")" "first"
+check "level 3: Copy link" "$(u3 'Copy link')" "@@copy:$AGAIN"
+check "...and says so" "$(u3 '')" "N;CHARSET=utf-8:Copied the link;;;;"
+check "level 3: Share link" "$(u3 'Share link')" "@@share:$AGAIN"
+check "Download again" "$(u3 'Download again')" "N;CHARSET=utf-8:Downloading it again;;;;"
+for try in $(seq 30); do line_for again.txt | grep -q ✅ && break; sleep 1; done
+[ "$(ls "$DL_SHARE" | grep -c '^again')" = 1 ] && [ ! -e "$DL_DIR/again.txt" ] &&
+  ok "downloading the same file again keeps one copy of it" || fail "after Download again: $(ls "$DL_SHARE" "$DL_DIR")"
+printf 'second, and longer\n' >"$tmp/www/again.txt"
+u3 '' >/dev/null
+u3 'again.txt' >/dev/null
+u3 'Download again' >/dev/null
+for try in $(seq 30); do line_for 'again (2).txt' | grep -q ✅ && break; sleep 1; done
+[ "$(cat "$DL_SHARE/again (2).txt" 2>/dev/null)" = "second, and longer" ] && [ "$(cat "$DL_SHARE/again.txt")" = first ] &&
+  ok "a different file of the same name gets a name of its own" || fail "after Download again of a changed file: $(ls "$DL_SHARE")"
+u3 '' >/dev/null
+u3 'again (2).txt' >/dev/null
+check "level 3: deleting a file in Files asks first" "$(u3 'Delete the file…')" "N;CHARSET=utf-8:Delete again (2).txt?;;;;"
+check "...then deletes it" "$(u3 'Yes, delete it')" "N;CHARSET=utf-8:Deleted again (2).txt;;;;"
+[ ! -e "$DL_SHARE/again (2).txt" ] && [ -e "$DL_SHARE/again.txt" ] && ok "...and only that file" ||
+  fail "deleting went wrong: $(ls "$DL_SHARE")"
 
 # Notifications, through the stand-in for Bark's server.
 [ ! -e "$tmp/bark.log" ] && ok "no notifications before they're turned on" ||

@@ -18,6 +18,7 @@ Both run in Alpine Linux inside the [iSH-AOK](https://github.com/emkey1/ish-AOK)
 | `dl` | the script that runs inside iSH-AOK. It picks yt-dlp or aria2 for each link, downloads in the background, lists downloads with progress bars, pauses and resumes them, and updates itself and its tools |
 | `shortcuts/setup-on-phone.sh` | sets everything up on the phone, and is what updates install: the tools, `dl`, location access, and the signed shortcut |
 | `build_shortcuts.py` | writes `shortcuts/aria2.shortcut` (unsigned), `shortcuts/setup-on-phone.sh` and `icons/` |
+| `web.py` | the live view and the player: a small web server, started by `dl` when they're opened |
 | `icons.py`, `icons/` | draws the menus' pictures (Python's standard library only); `icons/` has them as PNGs to look at |
 | `test.sh` | checks `dl` on a computer, using BusyBox tools like the phone does (needs `aria2c`, `yt-dlp`, `busybox`, `curl`, `ffmpeg` and `python3`) |
 
@@ -59,6 +60,7 @@ Both run in Alpine Linux inside the [iSH-AOK](https://github.com/emkey1/ish-AOK)
 
 ```
 ⬅️ Back
+📊 Watch live             Progress bars that move as they download
 ⏳ youtube.com video      Preparing 50% · unlocking the video link, about a minute…
 ⬇️ big-file.zip           32% · 1.2MiB/s · 30s left
 ⬇️ My Playlist            Video 3 of 12 · 45% · 1.2MiB/s
@@ -68,14 +70,23 @@ Both run in Alpine Linux inside the [iSH-AOK](https://github.com/emkey1/ish-AOK)
 ```
 
 - **The pictures:** a ring that fills up as a download goes (orange while it's preparing, blue while it downloads), a pause sign, a tick, or for a finished video, its own thumbnail.
-- **Tap a finished download** to open it in the Files app, which plays videos and music. A playlist opens its folder.
-- **Tap any other download** for its own screen: **⏸ Pause** or **▶️ Resume**, and **⏹ Stop and delete**, which stops it, deletes what it downloaded so far and removes it from the list. Failed downloads offer **🔁 Try again**.
+- **Tap a download** for its own menu. A finished one has:
+  - **▶️ Open:** plays a video or music right there, in a sheet, and shows pictures, PDFs and text. A playlist lists its videos to play.
+  - **📂 Show in folder:** its folder in the Files app.
+  - **🔁 Download again:** from the start, for when the file was moved or deleted. If it's still there, you keep one copy; if the new file is different, it's saved next to the old one as `name (2)`.
+  - **🔗 Copy link** and **📤 Share link:** the link it was downloaded from.
+  - **➖ Remove from the list** (the file stays), and **🗑 Delete the file…**, which asks first.
+- **A download that's still going** has **⏸ Pause** or **▶️ Resume**, **📊 Watch live**, and **⏹ Stop and delete**, which stops it, deletes what it downloaded so far and removes it from the list. Failed downloads offer **🔁 Try again**.
 - **A playlist part-way** offers **⏹ Stop here** instead: it keeps the videos it already finished (they go to Files like any download), deletes only the one it was on, and stays in the list as `Stopped · 3 of 12 videos`.
 - **⏳ Preparing** is everything before the download itself. For YouTube that's mostly unlocking the video link, which takes about a minute.
 - The list keeps only the 6 most recent finished downloads, and **🧹 Clear finished** removes them all. The files always stay. The buttons at the bottom only show when there's something for them to do.
 - **Playlists:** a playlist link (not a video that happens to be in one) downloads the whole playlist into a folder named after it. The ring is for the whole playlist.
 - **Videos** are saved as MP4 (H.264 when the site offers it, which plays everywhere on the iPhone), named after their title.
 - **To close the menu**, swipe it down.
+
+**📊 Watch live** opens a page with every download on it, refreshed every second: bars and rings that move as the downloads do, the speed and time left, and buttons to pause, resume, stop, open or download again. You can paste a link into it too. Tap **Done** to go back to the menu.
+
+It's a small web server in iSH-AOK (`web.py`), on 127.0.0.1 only and with a new password-like token each time it starts, so nothing else on the phone can use it. It stops by itself 5 minutes after the page was last open. **▶️ Open** uses it too.
 
 **⚙️ Settings** has everything else:
 
@@ -147,5 +158,6 @@ From this folder: `sh test.sh`
 - **Torrents** stop as soon as they finish (no seeding). If a torrent gets no data for 15 minutes, it gives up; tap it in the list to try again.
 - **`.torrent` files** shared as files (rather than as links) aren't handled yet. Magnet links and links to `.torrent` files work.
 - **Files' iSH-AOK location** can get stuck on "Loading". That's why finished downloads go to a folder you mount yourself (install step 3). Writing into a file in that folder while Files has it open can hang, so a new shortcut is copied in under another name first and then swapped in.
+- **The live view and the player** need iSH-AOK to stay running in the background, so they need location access set to **Always** (install step 6), like background downloads do.
 - **If the menus with pictures ever misbehave**, turn the pictures off from the iSH-AOK terminal: `touch /root/Downloads/.logs/.plain` (delete that file to turn them back on).
 - **Security:** any shortcut on the phone can run commands as root inside iSH-AOK. Don't import shortcuts you haven't read.

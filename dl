@@ -286,17 +286,34 @@ deliver() {  # deliver <id>: move the finished download into $SHARE, if that's m
   echo "=== moving to Files"
   if [ -d "$DEST/$top" ]; then
     # Merge into a folder of the same name, file by file, leaving out the partial files
-    # of anything unfinished and never overwriting.
+    # of anything unfinished.
     (cd "$DEST" && find "$top" -type f ! -name '*.part' ! -name '*.ytdl' ! -name '*.aria2') |
-      while IFS= read -r f; do
-        [ -e "$SHARE/$f" ] && continue
-        mkdir -p "$SHARE/${f%/*}" && timeout 1800 mv "$DEST/$f" "$SHARE/$f"
-      done
+      while IFS= read -r f; do place "$DEST/$f" "$SHARE/$f" >/dev/null; done
     find "$DEST/$top" -depth -type d -exec rmdir {} \; 2>/dev/null  # only the empty ones
     echo "FILE: $SHARE/$top"
-  elif [ ! -e "$SHARE/$top" ] && timeout 1800 mv "$DEST/$top" "$SHARE/"; then
-    echo "FILE: $SHARE/$top"
+  elif to=$(place "$DEST/$top" "$SHARE/$top"); then
+    echo "FILE: $to"
   fi
+}
+
+# place <finished file in $DEST> <where in Files>: moves it there, never over another file.
+# One of the same name and size is the same download, downloaded again: then the new copy
+# goes. Any other gets a name of its own, "name (2).ext". Prints where the file is.
+place() {
+  to=$2
+  if [ -e "$to" ]; then
+    if [ "$(stat -c %s "$1")" = "$(stat -c %s "$to" 2>/dev/null)" ]; then
+      rm -f "$1"
+      printf '%s\n' "$to"
+      return
+    fi
+    base=$to ext=
+    case ${to##*/} in ?*.*) base=${to%.*} ext=.${to##*.} ;; esac
+    i=2
+    while [ -e "$base ($i)$ext" ]; do i=$((i + 1)); done
+    to="$base ($i)$ext"
+  fi
+  mkdir -p "${to%/*}" && timeout 1800 mv "$1" "$to" && printf '%s\n' "$to"
 }
 
 link_name() {
@@ -652,25 +669,36 @@ act() {  # act <chosen menu line>
 #   @@clipboard     adds the link on the clipboard
 #   @@app           opens iSH-AOK
 #   @@exit          closes
+# and, from shortcuts of level 3 on, without closing:
+#   @@web:<link>    shows the page in a Safari sheet: the live view, or the player
+#   @@copy:<text>   copies the text
+#   @@share:<text>  shares the text
 # Anything else is a screen of rows: vCards, which Choose from List shows as contacts, each
 # with a picture, a title and a line under it (the "vCard menu" trick, as in Cherri's
 # chooseFromVCard), or plain lines when pictures are off. What comes back is what the row
 # showed: a vCard's title, or the whole line. So every screen lives here, and changing one
 # never needs a new shortcut.
 #
-# The shortcut from before pictures (c819f7f3) sends no -k. It gets plain lines, opens only
-# shareddocuments:// links as they are, and knows no @@import.
+# A shortcut's version says what it can do: "<level>-<hash>" from level 3 on. c1a2b4d4,
+# level 2, has pictures but no @@web, @@copy or @@share. The one before pictures
+# (c819f7f3), level 0, sends no -k: it gets plain lines, opens only shareddocuments://
+# links as they are, and knows no @@import.
 #
-# Kept in $JOBS: .screen (main, list, "item <id>", settings or notifications), .menu (one
-# line per row on show: its key, a tab, then what it showed) and .notice (a message for the
-# next screen: a title line, then a detail line).
+# Kept in $JOBS: .screen (main, list, "item <id>", "confirm <id>", settings or
+# notifications), .menu (one line per row on show: its key, a tab, then what it showed)
+# and .notice (a message for the next screen: a title line, then a detail line).
 
 KEEP_FINISHED=6  # finished downloads the list keeps; older ones drop off it (files stay)
 ICONS=${DL_ICONS:-/usr/local/share/dl/icons}  # the pictures, base64 PNGs, from setup
 BARK_APP=https://apps.apple.com/app/bark-custom-notifications/id1403753865
+WEB=${DL_WEB:-/usr/local/share/dl/web.py}  # the live view's server, from setup
+WEB_PORT=${DL_WEB_PORT:-8486}
 
 ui() {  # ui <what was tapped>
   screen=$(cat "$JOBS/.screen" 2>/dev/null)
+  LEVEL=0
+  [ -n "$SHORTCUT" ] && LEVEL=2
+  case $SHORTCUT in [0-9]*-*) LEVEL=${SHORTCUT%%-*} ;; esac
   case $1 in
     @@start) screen=main; opening || return 0 ;;
     '') ;;
@@ -689,6 +717,7 @@ ui() {  # ui <what was tapped>
   case $screen in
     list) list_screen ;;
     item\ *) item_screen "${screen#item }" ;;
+    confirm\ *) confirm_screen "${screen#confirm }" ;;
     settings) settings_screen ;;
     notifications) notifications_screen ;;
     *) main_screen ;;
@@ -712,7 +741,7 @@ render() {
       n = split("⬅️ back 📥 downloads ⬇️ downloads ➕ add 📂 folder 📦 folder ⚙️ settings 🆕 new " \
         "🔔 bell 🔕 belloff ⬆️ update 🔧 tools 📲 app ⏸ pause ▶️ play ⏹ stop 🔁 retry " \
         "🔄 refresh 🗑 trash ℹ️ info ✅ done ⚠️ failed 🧹 clear 🖼 pictures ⏳ prep0 " \
-        "1️⃣ appstore 2️⃣ copy 3️⃣ paste", w, " ")
+        "1️⃣ appstore 2️⃣ copy 3️⃣ paste 📊 live 📤 share 🔗 copy ➖ remove", w, " ")
       for (i = 1; i < n; i += 2) pic[w[i]] = w[i + 1]
       printf "" > menu
     }
@@ -773,7 +802,7 @@ row_key() {  # row_key <what was tapped>: the key of the row that showed it
 }
 
 tapped() {  # tapped <key>: act on the row tapped. Fails after printing an answer for the Shortcut.
-  id=${screen#item }
+  id=${screen#* }  # on the screen of one download: "item <id>" or "confirm <id>"
   case $1 in
     '' | notice | self) ;;  # just show the screen again
     back:*) screen=${1#back:} ;;
@@ -782,7 +811,9 @@ tapped() {  # tapped <key>: act on the row tapped. Fails after printing an answe
     folder) open_link "$(files_url "$SHARE" || echo shareddocuments://)"; return 1 ;;
     settings) screen=settings ;;
     import) import_shortcut || return 1 ;;
-    dl:*) open_or_show "${1#dl:}" || return 1 ;;
+    dl:*) screen="item ${1#dl:}" ;;
+    live) open_web / || return 1 ;;
+    live:*) open_web / "${1#live:}" || return 1 ;;  # scrolled to that download
     pauseall) notice "$(pause_all)" ;;
     resumeall) notice "$(resume_all)" ;;
     clear) notice "$(clear_finished)" ;;
@@ -790,7 +821,13 @@ tapped() {  # tapped <key>: act on the row tapped. Fails after printing an answe
     resume) load "$id"; start "$link" "$id" ;;
     stop) notice "$(stop "$id")"; screen=list ;;
     remove) load "$id"; forget "$id"; notice "Removed from the list" "${playlist:-$name}"; screen=list ;;
-    open) open_or_show "$id" || return 1 ;;
+    open) open_download "$id" || return 1 ;;
+    show) show_folder "$id" || return 1 ;;
+    again) notice "$(again "$id")"; screen=list ;;
+    copy) load "$id"; copy_text "$link" || return 1 ;;
+    share) load "$id"; echo "@@share:$link"; return 1 ;;
+    delete) screen="confirm $id" ;;
+    delete-yes) notice "$(delete_download "$id")"; screen=list ;;
     notifications) screen=notifications ;;
     update-app)
       if [ -s "$SHORTCUTS/.pending" ]; then
@@ -938,12 +975,20 @@ list_screen() {
   set -- $(ids | head -n $SHOWN)
   [ $# -gt 0 ] || row notice ℹ️ "No downloads yet" "Share a link to aria2 to start one"
   running= paused= finished=
+  # The downloads' rows go aside first: the live view's row comes before them, if anything
+  # is running.
+  screen_rows=$rows rows=$rows.list
+  : >"$rows"
   for id; do
     load "$id"
     describe "$id"
     row "dl:$id" "$emoji" "$title" "$detail" "$pic"
     case $state in running) running=1 ;; paused) paused=1 ;; *) finished=1 ;; esac
   done
+  rows=$screen_rows
+  [ -n "$running" ] && web_ok && row live 📊 "Watch live" "Progress bars that move as they download"
+  cat "$rows.list" >>"$rows"
+  rm -f "$JOBS/.rows.$$.list"
   [ -n "$running" ] && row pauseall ⏸ "Pause all"
   [ -n "$paused" ] && row resumeall ▶️ "Resume all"
   [ -n "$finished" ] && row clear 🧹 "Clear finished" "The files stay in Downloads"
@@ -960,12 +1005,59 @@ item_screen() {  # item_screen <id>
   load "$1"
   describe "$1"
   [ -s "$JOBS/$1.thumb" ] && pic=$JOBS/$1.thumb
+  [ "$state" = done ] && detail="$detail · $(ago_of "$JOBS/$1.log")"
   row self "$emoji" "$title" "$detail" "$pic"
+  from=$(host_of "$link")
+  case $link in magnet:*) from="a magnet link" ;; esac
   case $state in
-    running) row pause ⏸ Pause "Resume it any time"; stop_row ;;
-    paused) row resume ▶️ Resume; stop_row ;;
-    failed) row resume 🔁 "Try again"; row remove 🗑 "Remove from the list" ;;
-    done) row open ▶️ Open "In the Files app"; row remove 🗑 "Remove from the list" "The file stays in Downloads" ;;
+    running)
+      row pause ⏸ Pause "Resume it any time"
+      web_ok && row "live:$1" 📊 "Watch live" "A progress bar that moves as it downloads"
+      stop_row ;;
+    paused) row resume ▶️ Resume "From where it stopped"; stop_row ;;
+    failed) row resume 🔁 "Try again" "From where it stopped" ;;
+    done)
+      if web_ok; then
+        row open ▶️ Open "Plays it right here"
+      else
+        row open ▶️ Open "In the Files app"
+      fi
+      row show 📂 "Show in folder" "$(folder_name)"
+      row again 🔁 "Download again" "In case it was moved or deleted" ;;
+  esac
+  row copy 🔗 "Copy link" "$from"
+  [ "$LEVEL" -ge 3 ] && row share 📤 "Share link" "$from"
+  case $state in
+    done) row remove ➖ "Remove from the list" "The file stays where it is" ;;
+    failed) row remove ➖ "Remove from the list" ;;
+  esac
+  # Only a single file: a playlist's folder may hold more than this download put there.
+  if [ "$state" = done ] && [ -z "$playlist" ]; then
+    case $path in "$SHARE"/?* | "$DEST"/?*) row delete 🗑 "Delete the file…" "Asks first" ;; esac
+  fi
+}
+
+confirm_screen() {  # confirm_screen <id>: are you sure you want to delete its file?
+  load "$1"
+  row notice ⚠️ "Delete $name?" "It goes for good, from Files too"
+  row delete-yes 🗑 "Yes, delete it"
+  row "back:item $1" ⬅️ "No, keep it"
+}
+
+ago_of() {  # ago_of <file>: how long since it last changed, e.g. "3 h ago"
+  date -r "$1" +%s >"$JOBS/.ago.$$" 2>/dev/null && ago "$JOBS/.ago.$$"
+  rm -f "$JOBS/.ago.$$"
+}
+
+# Where a finished download's file is, for its "Show in folder" row: the folder's name.
+folder_name() {
+  case $path in
+    "$SHARE"/*)
+      dir=$path
+      [ -n "$playlist" ] || dir=${path%/*}
+      if [ "$dir" = "$SHARE" ]; then dir=$(share_host); fi
+      echo "In Files: ${dir##*/}" ;;
+    *) echo "In iSH-AOK's own Downloads folder" ;;
   esac
 }
 
@@ -1054,19 +1146,126 @@ notifications_screen() {
 
 # A finished download opens in the Files app; any other shows its own screen. Fails after
 # printing an answer for the Shortcut.
-open_or_show() {  # open_or_show <id>
+open_download() {  # open_download <id>
   load "$1"
-  if [ "$state" != done ]; then
-    screen="item $1"
-    return 0
-  fi
+  # The player plays videos and music right in the shortcut's Safari sheet.
+  web_ok && { open_web "/play/$1" || return 1; return 0; }
   case $path in
     "$SHARE"/*)
       open_link "$(files_url "$path" || echo "shareddocuments://")"
       return 1 ;;
   esac
+  not_in_files
+}
+
+show_folder() {  # show_folder <id>: its folder in the Files app
+  load "$1"
+  dir=$path
+  [ -n "$playlist" ] || dir=${path%/*}
+  case $dir in
+    "$SHARE" | "$SHARE"/*)
+      open_link "$(files_url "$dir" || echo "shareddocuments://")"
+      return 1 ;;
+  esac
+  not_in_files
+}
+
+not_in_files() {
   notice "It's in iSH-AOK's own Downloads folder" "To get downloads in a Files folder, mount one in iSH-AOK: mount -t ios phone /mnt/phone"
   return 0
+}
+
+copy_text() {  # copy_text <text>: the answer that copies it, or else a notice showing it
+  if [ "$LEVEL" -ge 3 ]; then
+    notice "Copied the link" "$1"
+    echo "@@copy:$1"
+    return 1
+  fi
+  notice "Its link" "$1"
+  return 0
+}
+
+# Download a finished download again, from the start and as a new download, for when its
+# file was moved or deleted. If the file is still there, place (in deliver) keeps one copy.
+again() {  # again <id>: prints what it did, as a title line and a detail line
+  load "$1"
+  title=${playlist:-$name}
+  [ "$state" = running ] && pause "$1"
+  forget "$1"
+  last=$(ids | head -n 1)
+  start "$link" $((${last:-0} + 1))
+  echo "Downloading it again"
+  echo "$title"
+}
+
+# Delete a finished download's file, wherever dl put it, then drop it from the list.
+delete_download() {  # delete_download <id>: prints what it did, as a title line and a detail line
+  load "$1"
+  case $path in
+    */../* | */..) echo "Couldn't delete $name"; return ;;
+    "$SHARE"/?* | "$DEST"/?*) ;;
+    *) echo "Couldn't find $name's file"; return ;;
+  esac
+  if [ ! -e "$path" ]; then
+    forget "$1"
+    echo "Removed $name from the list"
+    echo "Its file was already gone"
+  elif [ -f "$path" ] && timeout 60 rm -f "$path"; then
+    forget "$1"
+    echo "Deleted $name"
+    echo "It's gone from Files"
+  else
+    echo "Couldn't delete $name"
+    echo "Delete it in the Files app instead"
+  fi
+}
+
+# ---- The live view: web.py, a small web server, shown in the shortcut's Safari sheet ----
+
+web_ok() {  # can this shortcut show it, and is it installed?
+  [ "$LEVEL" -ge 2 ] && [ -f "$WEB" ] && command -v python3 >/dev/null
+}
+
+# web_link <path> [<download to scroll to>]: the live view's link, after starting its server
+# if it isn't answering. Each start gets a new token, which every request has to carry.
+web_link() {
+  token=$(cat "$JOBS/.web-token" 2>/dev/null)
+  if [ -z "$token" ] || ! curl -fs -m 2 -o /dev/null "http://127.0.0.1:$WEB_PORT/status?t=$token"; then
+    pkill -f "$WEB $WEB_PORT" 2>/dev/null
+    token=$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')
+    echo "$token" >"$JOBS/.web-token"
+    WEB_DEST=$DEST WEB_SHARE=$SHARE WEB_SHARE_HOST=$(share_host) WEB_DL=$0 \
+      $(command -v setsid) nohup python3 "$WEB" "$WEB_PORT" "$token" >"$JOBS/.web.log" 2>&1 </dev/null &
+    # Python takes a few seconds to start in iSH-AOK; the Shortcut gives up after 20.
+    tries=0
+    until curl -fs -m 2 -o /dev/null "http://127.0.0.1:$WEB_PORT/status?t=$token"; do
+      tries=$((tries + 1))
+      [ $tries -ge 24 ] && return 1
+      sleep 0.5
+    done
+  fi
+  echo "http://127.0.0.1:$WEB_PORT$1?t=$token${2:+#$2}"
+}
+
+open_web() {  # open_web <path> [<download>]: the answer that shows it. Fails once it's given.
+  if ! url=$(web_link "$1" "$2"); then
+    notice "The live view didn't start" "$(tail -n 1 "$JOBS/.web.log" 2>/dev/null)"
+    return 0
+  fi
+  # Level 2 can't show a page in a sheet, so Safari opens it instead.
+  if [ "$LEVEL" -ge 3 ]; then echo "@@web:$url"; else echo "@@open:$url"; fi
+  return 1
+}
+
+web_act() {  # web_act <id> <pause|resume|stop|again>: the live view's buttons
+  [ -f "$JOBS/$1.log" ] || { echo "That download is no longer in the list."; return; }
+  load "$1"
+  case $2 in
+    pause) pause "$1"; rest_unless_busy; echo "Paused ${playlist:-$name}" ;;
+    resume) start "$link" "$1"; echo "Resumed ${playlist:-$name}" ;;
+    stop) out=$(stop "$1"); printf '%s\n' "$out" | head -n 1 ;;
+    again) out=$(again "$1"); printf '%s\n' "$out" | tail -n 1 | sed 's/^/Downloading again: /' ;;
+  esac
 }
 
 # shareddocuments://<iOS path> opens a file or folder in the Files app. iSH-AOK lists the
@@ -1165,6 +1364,9 @@ case $1 in
   --shortcut) base64 "$SHORTCUTS/aria2.shortcut" | tr -d '\n' ;;  # for @@import
   --work) work "$2" ;;
   --thumb) thumb "$2" "$3" ;;
+  --act) web_act "$2" "$3" ;;      # the live view's buttons (web.py)
+  --awake) keep_awake ;;           # while the live view is open
+  --rest) rest_unless_busy ;;      # when it closes
   --update)
     keep_awake
     case $2 in tools | app) update_now "$2" ;; *) update_now tools; update_now app ;; esac
