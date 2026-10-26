@@ -4,15 +4,17 @@
 Writes into shortcuts/:
   aria2.shortcut      unsigned; to use it directly, sign it on a Mac:
                       shortcuts sign -m anyone -i aria2.shortcut -o "aria2 (signed).shortcut"
-  setup-on-phone.sh   run in iSH-AOK: installs aria2, yt-dlp and dl, asks for location access,
-                      then signs the shortcut with RoutineHub's HubSign service into
-                      /root/Shortcuts
+  setup-on-phone.sh   run in iSH-AOK: installs aria2, yt-dlp, dl and its pictures, asks for
+                      location access, then signs the shortcut with RoutineHub's HubSign
+                      service into /root/Shortcuts, and into the Files folder at /mnt/phone
+and the pictures for dl's menus into icons/ (drawn by icons.py).
 
 The iSH-AOK identifiers below come from its source (github.com/emkey1/ish-AOK):
 app/ISHRunCommandIntent.swift for the intent and its parameters, and
 fastlane/Appfile for the bundle ID and team ID of the TestFlight build.
 The plist layout follows Cherri's encoders (github.com/electrikmilk/cherri).
 """
+import base64
 import hashlib
 import itertools
 import json
@@ -20,6 +22,8 @@ import plistlib
 import re
 import uuid
 from pathlib import Path
+
+import icons
 
 HERE = Path(__file__).resolve().parent
 OUT = HERE / "shortcuts"
@@ -104,11 +108,11 @@ def run_command(*command):
                   command=text(*command))
 
 
-def run_with_base64(command, variable):
-    """Run `<command> '<variable, base64-encoded>'`, so nothing in it can act as shell syntax."""
+def run_with_base64(command, variable, after=""):
+    """Run `<command> '<variable, base64-encoded>'<after>`, so nothing in it can act as shell syntax."""
     as_text = action("gettext", WFTextActionText=text(variable))
     encoded = action("base64encode", WFEncodeMode="Encode", WFInput=attachment(output_of(as_text, "Text")))
-    run = run_command(f"{command} '", output_of(encoded, "Base64 Encoded"), "'")
+    run = run_command(f"{command} '", output_of(encoded, "Base64 Encoded"), "'" + after)
     return [as_text, encoded, run], run
 
 
@@ -129,7 +133,14 @@ def variable(name):
     return {"Type": "Variable", "VariableName": name}
 
 
-def aria2():
+def as_contacts(value):
+    """The value read as contacts: a .vcf file becomes one contact per vCard (Cherri's `.contact`)."""
+    return {**value, "Aggrandizements": [
+        {"Type": "WFCoercionVariableAggrandizement", "CoercionItemClass": "WFContactContentItem"}]}
+
+
+def aria2(version):
+    """The shortcut. It tells dl its version, so dl knows which answers and screens it takes."""
     acts = []
 
     # Shared from another app: start the download and say so. It carries on in the
@@ -139,35 +150,65 @@ def aria2():
     acts += [if_(shared, SHORTCUT_INPUT, HAS_ANY_VALUE), *start, notify(run),
              action("exit"), control("conditional", shared, END)]
 
-    # Opened on its own: dl's screens (see `dl -ui`), one after another until Close. Each
-    # time round, dl gets the line tapped last ("@@start" the first time) and prints the
-    # next screen, or an answer only the Shortcut can carry out.
+    # Opened on its own: dl's screens (see `dl -ui`), one after another until it's closed.
+    # Each time round, dl gets what was tapped last ("@@start" the first time) and this
+    # shortcut's version, and prints the next screen, or an answer only the Shortcut can
+    # carry out.
     start_text = action("gettext", WFTextActionText=text("@@start"))
     acts += [start_text, set_variable("tapped", output_of(start_text, "Text"))]
     loop = new_uuid()
-    ui, run = run_with_base64("dl -ui -b", variable("tapped"))
+    ui, run = run_with_base64("dl -ui -b", variable("tapped"), f" -k {version}")
     answer = output_of(run, "Run Command")
     acts += [control("repeat.count", loop, START, WFRepeatCount=500), *ui]
 
-    opens, close, open_app, clipboard_add = new_uuid(), new_uuid(), new_uuid(), new_uuid()
-    acts += [if_(opens, answer, BEGINS_WITH, "shareddocuments:"),
-             action("openurl", WFInput=text(answer)), action("exit"),
+    # @@open:<link>: open it (a file or folder in Files, or the App Store), then close.
+    opens = new_uuid()
+    link = action("text.replace", WFInput=text(answer), WFReplaceTextFind="@@open:", WFReplaceTextReplace="")
+    acts += [if_(opens, answer, BEGINS_WITH, "@@open:"), link,
+             action("openurl", WFInput=text(output_of(link, "Updated Text"))), action("exit"),
              control("conditional", opens, END)]
+    close, open_app = new_uuid(), new_uuid()
     acts += [if_(close, answer, BEGINS_WITH, "@@exit"), action("exit"),
              control("conditional", close, END)]
     acts += [if_(open_app, answer, BEGINS_WITH, "@@app"), open_ish_aok(), action("exit"),
              control("conditional", open_app, END)]
+
+    # @@import: dl prints the new shortcut, signed, as base64. Opened as a .shortcut file, it
+    # makes iOS offer to import it, so nobody has to find it in Files.
+    imports = new_uuid()
+    fetch = run_command("dl --shortcut")
+    decoded = action("base64encode", WFEncodeMode="Decode", WFInput=attachment(output_of(fetch, "Run Command")))
+    named = action("setitemname", WFInput=attachment(output_of(decoded, "Base64 Decoded")),
+                   WFName=f"{NAME}.shortcut")
+    acts += [if_(imports, answer, BEGINS_WITH, "@@import"), fetch, decoded, named,
+             action("openin", WFInput=attachment(output_of(named, "Renamed Item")), WFOpenInAskWhenRun=False),
+             action("exit"), control("conditional", imports, END)]
+
+    # @@clipboard: add the copied link. Anything else is a screen to choose from: vCards,
+    # which, saved as a .vcf and read as contacts, show as rows with a picture and a line
+    # under the title (the trick Cherri's chooseFromVCard uses), or plain lines.
+    clipboard_add, cards = new_uuid(), new_uuid()
     clipboard = action("getclipboard")
     from_clipboard, added = run_with_base64("dl -b", output_of(clipboard, "Clipboard"))
     nothing = action("gettext", WFTextActionText=text(""))  # then dl shows the same screen again
+    vcards = action("gettext", WFTextActionText=text(answer))
+    menu = action("setitemname", WFInput=attachment(output_of(vcards, "Text")), WFName="menu.vcf")
+    pick = action("choosefromlist", WFInput=attachment(as_contacts(output_of(menu, "Renamed Item"))),
+                  WFChooseFromListActionPrompt=NAME)
+    title = action("properties.contacts", WFInput=attachment(output_of(pick, "Chosen Item")),
+                   WFContentItemPropertyName="Name")
     lines = action("text.split", text=text(answer), WFTextSeparator="New Lines")
     choose = action("choosefromlist", WFInput=attachment(output_of(lines, "Split Text")),
-                    WFChooseFromListActionPrompt="aria2")
+                    WFChooseFromListActionPrompt=NAME)
     acts += [if_(clipboard_add, answer, BEGINS_WITH, "@@clipboard"),
              clipboard, *from_clipboard, notify(added),
              nothing, set_variable("tapped", output_of(nothing, "Text")),
              control("conditional", clipboard_add, MIDDLE),
+             if_(cards, answer, BEGINS_WITH, "BEGIN:VCARD"),
+             vcards, menu, pick, title, set_variable("tapped", output_of(title, "Name")),
+             control("conditional", cards, MIDDLE),
              lines, choose, set_variable("tapped", output_of(choose, "Chosen Item")),
+             control("conditional", cards, END),
              control("conditional", clipboard_add, END)]
 
     acts.append(control("repeat.count", loop, END))
@@ -190,12 +231,15 @@ def aria2():
 SETUP = """\
 #!/bin/sh
 # Sets up (or updates) downloads in iSH-AOK: installs aria2, yt-dlp (with Node and QuickJS
-# for YouTube, and ffmpeg for joining video and audio), curl and the dl script; asks for
-# location access, which keeps downloads going in the background; then signs the "aria2"
-# shortcut with RoutineHub's HubSign service (the signer Cherri and RoutineHub tools use)
-# and saves it in Files -> iSH-AOK -> (Alpine) -> root -> Shortcuts.
-# dl runs the newest copy of this script from the project's repository when it changes.
+# for YouTube, and ffmpeg for joining video and audio), curl, the dl script and the pictures
+# for its menus; asks for location access, which keeps downloads going in the background;
+# then signs the "aria2" shortcut with RoutineHub's HubSign service (the signer Cherri and
+# RoutineHub tools use) and puts it in the Files folder mounted at /mnt/phone.
+# dl runs the newest copy of this script from the project's repository when it changes,
+# with DL_APP_ONLY=1: then the tools are left alone, since they have their own update.
 # Generated by build_shortcuts.py.
+
+mkdir -p /root/Downloads/.logs
 
 # Location updates are what keep iSH-AOK running when it's not on screen, so start them
 # first: then the install below carries on if you leave the app. The first time, iOS asks.
@@ -208,21 +252,26 @@ if ! pgrep -f 'dd if=/dev/location' >/dev/null; then
   awake=$!
 fi
 
-echo "Installing aria2, yt-dlp, Node and ffmpeg. The first time, this downloads about 150 MB."
-apk add -q aria2 curl ffmpeg nodejs yt-dlp-ejs-rt-quickjs yt-dlp ||
-  apk add -q aria2 curl ffmpeg nodejs yt-dlp ||
-  echo "Couldn't install everything; carrying on with what's there."
+if [ -z "$DL_APP_ONLY" ] || ! command -v aria2c >/dev/null || ! command -v yt-dlp >/dev/null ||
+    ! command -v ffmpeg >/dev/null; then
+  echo "Installing aria2, yt-dlp, Node and ffmpeg. The first time, this downloads about 150 MB."
+  apk add -q aria2 curl ffmpeg nodejs yt-dlp-ejs-rt-quickjs yt-dlp ||
+    apk add -q aria2 curl ffmpeg nodejs yt-dlp ||
+    echo "Couldn't install everything; carrying on with what's there."
 
-# yt-dlp's own release, next to Alpine's: YouTube changes often, Alpine's package lags
-# behind, and only this one can update itself (dl runs `yt-dlp -U` once a day).
-echo "Installing the latest yt-dlp from its own releases."
-if curl -fsSL -m 300 -o /usr/local/bin/yt-dlp.new \\
-    https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp; then
-  chmod +x /usr/local/bin/yt-dlp.new
-  mv -f /usr/local/bin/yt-dlp.new /usr/local/bin/yt-dlp
-else
-  rm -f /usr/local/bin/yt-dlp.new
-  echo "Couldn't download it; using Alpine's yt-dlp for now."
+  # yt-dlp's own release, next to Alpine's: YouTube changes often, Alpine's package lags
+  # behind, and only this one can update itself (dl runs `yt-dlp -U` once a day).
+  echo "Installing the latest yt-dlp from its own releases."
+  if curl -fsSL -m 300 -o /usr/local/bin/yt-dlp.new \\
+      https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp; then
+    chmod +x /usr/local/bin/yt-dlp.new
+    mv -f /usr/local/bin/yt-dlp.new /usr/local/bin/yt-dlp
+  else
+    rm -f /usr/local/bin/yt-dlp.new
+    echo "Couldn't download it; using Alpine's yt-dlp for now."
+  fi
+  yt-dlp --version >/root/Downloads/.logs/.yt-dlp-version 2>/dev/null
+  date +%s >/root/Downloads/.logs/.updated
 fi
 
 # The list's format changed in version 2 of dl. Downloads from an older dl would keep going
@@ -233,16 +282,22 @@ if [ ! -e /root/Downloads/.logs/.v2 ]; then
   rm -f /root/Downloads/.logs/*
 fi
 
+# "=== app" lines say what's happening, in Settings, while dl's update runs this.
+echo "=== app Installing the new version"
 # Write the new dl next to the old one and swap them in one step: a download that's running
 # keeps reading the old file, where overwriting it in place would break it mid-run.
 cat >/usr/local/bin/dl.new <<'DL_SCRIPT'
 {dl}DL_SCRIPT
 chmod +x /usr/local/bin/dl.new
 mv -f /usr/local/bin/dl.new /usr/local/bin/dl
-mkdir -p /root/Downloads/.logs
+# The pictures in dl's menus: a name and a base64 PNG on each line.
+mkdir -p /usr/local/share/dl/icons
+while read -r icon data; do
+  printf '%s' "$data" >"/usr/local/share/dl/icons/$icon.b64"
+done <<'ICONS'
+{icons}ICONS
 touch /root/Downloads/.logs/.v2
-date +%s >/root/Downloads/.logs/.updated
-# dl's daily update compares the repository's copy of this script against this hash.
+# dl's update compares the repository's copy of this script against this hash.
 sha256sum <"$0" | cut -d' ' -f1 >/root/Downloads/.logs/.setup
 echo "Installed dl."
 
@@ -253,27 +308,36 @@ rm -f "Download with aria2.shortcut" "Download Status.shortcut" "Stop Downloads.
 new_shortcut=
 if [ "$(cat .version 2>/dev/null)" = {version} ] && [ -e {name}.shortcut ]; then
   echo "The {name} shortcut hasn't changed: no need to import it again."
-elif ! curl -sS -m 90 -X POST -H 'Content-Type: application/json' --data-binary @- \\
-    https://hubsign.routinehub.services/sign -o {name}.shortcut <<'EOF'
+else
+  echo "=== app Signing the new shortcut"
+  if ! curl -sS -m 90 -X POST -H 'Content-Type: application/json' --data-binary @- \\
+      https://hubsign.routinehub.services/sign -o {name}.shortcut.new <<'EOF'
 {request}
 EOF
-then
-  echo "FAILED to sign the shortcut: no answer from HubSign."
-elif [ "$(head -c 4 {name}.shortcut)" = AEA1 ]; then
-  echo {version} >.version
-  new_shortcut="Files -> iSH-AOK -> (Alpine) -> root -> Shortcuts -> {name}.shortcut"
-  # Also put it in the Files folder mounted at /mnt/phone, under a name of its own: writing
-  # over a file that Files has open there can hang.
-  if awk '$2 == "/mnt/phone" { found = 1 } END { exit !found }' /proc/mounts 2>/dev/null &&
-      timeout 60 cp {name}.shortcut /mnt/phone/{name}-{version}.shortcut; then
-    new_shortcut="Files -> On My iPhone -> Downloads -> {name}-{version}.shortcut"
+  then
+    echo "FAILED to sign the shortcut: no answer from HubSign."
+  elif [ "$(head -c 4 {name}.shortcut.new)" = AEA1 ]; then
+    mv -f {name}.shortcut.new {name}.shortcut
+    echo {version} >.version
+    new_shortcut=/root/Shortcuts/{name}.shortcut
+    # Also into the Files folder mounted at /mnt/phone, always as {name}.shortcut, in place
+    # of the one before: copied in under another name first, because writing into a file
+    # that Files has open there can hang. Builds before used to be {name}-<version>.shortcut.
+    if awk '$2 == "/mnt/phone" { found = 1 } END { exit !found }' /proc/mounts 2>/dev/null; then
+      timeout 60 rm -f /mnt/phone/{name}-*.shortcut
+      if timeout 60 cp {name}.shortcut /mnt/phone/.{name}.shortcut.new &&
+          timeout 60 mv -f /mnt/phone/.{name}.shortcut.new /mnt/phone/{name}.shortcut; then
+        new_shortcut=/mnt/phone/{name}.shortcut
+      fi
+    fi
+    # The shortcut, when it next opens, offers the new one by itself. dl's menu shows it
+    # until the new shortcut has been imported, which it can tell from the version.
+    echo "$new_shortcut" >.pending
+    echo "Signed the new {name} shortcut."
+  else
+    echo "FAILED to sign the shortcut: $(head -c 300 {name}.shortcut.new)"
   fi
-  # The download list shows where it is until it's tapped: an update may run this unseen.
-  echo "$new_shortcut" >/root/Shortcuts/.pending
-  echo "Signed the new {name} shortcut."
-else
-  echo "FAILED to sign the shortcut: $(head -c 300 {name}.shortcut)"
-  rm -f /root/Shortcuts/{name}.shortcut
+  rm -f /root/Shortcuts/{name}.shortcut.new
 fi
 cd /root || exit 1
 [ -n "$awake" ] && kill $awake 2>/dev/null
@@ -283,9 +347,11 @@ dl -v
 
 echo
 echo "Setup finished."
-if [ -n "$new_shortcut" ]; then
-  echo "Next: import the new shortcut. Tap $new_shortcut and choose Replace."
-fi
+case $new_shortcut in
+  /mnt/phone/*) echo "Next: in Files, open the folder you mounted at /mnt/phone and tap {name}.shortcut." ;;
+  /root/*) echo "Next: in Files, tap iSH-AOK -> (Alpine) -> root -> Shortcuts -> {name}.shortcut." ;;
+esac
+[ -n "$new_shortcut" ] && echo "Add it, or choose Replace if you already have the {name} shortcut."
 cat <<'DONE'
 If you haven't yet: Settings -> Apps -> iSH-AOK -> Location: choose Always, and turn
 Precise Location off to save battery. Without Always, downloads only run while iSH-AOK is open.
@@ -299,15 +365,36 @@ def hubsign_request(name, plist):
     return json.dumps({"shortcutName": name, "shortcut": xml})
 
 
+def build(version):
+    global _uuids
+    _uuids = itertools.count(1)  # the same UUIDs on every build
+    return aria2(version)
+
+
+def binary(plist):
+    return plistlib.dumps(plist, fmt=plistlib.FMT_BINARY)
+
+
 if __name__ == "__main__":
     OUT.mkdir(exist_ok=True)
-    plist = aria2()
+    # The version is a hash of the shortcut built without one, so it changes whenever
+    # anything else in the shortcut does.
+    version = hashlib.sha256(binary(build(""))).hexdigest()[:8]
+    plist = build(version)
     path = OUT / f"{NAME}.shortcut"
-    path.write_bytes(plistlib.dumps(plist, fmt=plistlib.FMT_BINARY))
-    print(path)
+    path.write_bytes(binary(plist))
+    print(path, version)
+
+    # The pictures for dl's menus, also written to icons/ to look at.
+    (HERE / "icons").mkdir(exist_ok=True)
+    pictures = ""
+    for name, png in icons.icons().items():
+        (HERE / "icons" / f"{name}.png").write_bytes(png)
+        pictures += f"{name} {base64.b64encode(png).decode()}\n"
+
     path = OUT / "setup-on-phone.sh"
     dl = (HERE / "dl").read_text()
-    version = hashlib.sha256(plistlib.dumps(plist, fmt=plistlib.FMT_BINARY)).hexdigest()[:8]
-    path.write_text(SETUP.replace("{dl}", dl).replace("{name}", NAME).replace("{version}", version)
-                    .replace("{request}", hubsign_request(NAME, plist)))
+    setup = (SETUP.replace("{name}", NAME).replace("{version}", version)
+             .replace("{request}", hubsign_request(NAME, plist)))
+    path.write_text(setup.replace("{icons}", pictures).replace("{dl}", dl))  # last: they're big
     print(path)

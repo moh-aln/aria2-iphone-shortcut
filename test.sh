@@ -1,6 +1,6 @@
 #!/bin/sh
 # Checks dl on a computer, the way the iPhone runs it: BusyBox ash and BusyBox's text tools,
-# links base64-encoded. Needs aria2c, yt-dlp, busybox, curl, python3 (for a local web page
+# links base64-encoded. Needs aria2c, yt-dlp, busybox, curl, ffmpeg, python3 (for a local web page
 # with a video in it) and internet access. Run: sh test.sh
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
@@ -17,12 +17,18 @@ mkdir "$DL_SHORTCUTS"
 mkdir "$tmp/www"
 curl -sSL -o "$tmp/www/rabbit.mp4" \
   https://raw.githubusercontent.com/mdn/learning-area/main/html/multimedia-and-embedding/video-and-audio-content/rabbit320.mp4
-printf '<!doctype html><title>Rabbit test page</title><video src="rabbit.mp4"></video>\n' >"$tmp/www/video.html"
+# The video's poster is the picture the menus show for it (see thumb in dl).
+printf '<!doctype html><title>Rabbit test page</title><video src="rabbit.mp4" poster="poster.png"></video>\n' \
+  >"$tmp/www/video.html"
+cp "$here/icons/done.png" "$tmp/www/poster.png"
 printf '<!doctype html><title>Just text</title><p>No video here.</p>\n' >"$tmp/www/text.html"
 cp "$tmp/www/rabbit.mp4" "$tmp/www/rabbit2.mp4"
 printf '<!doctype html><title>Rabbit playlist</title><video src="rabbit.mp4"></video><video src="rabbit2.mp4"></video>\n' \
   >"$tmp/www/playlist.html"
 printf '<!doctype html><title>Slow page</title><video src="rabbit2.mp4"></video>\n' >"$tmp/www/slow.html"
+cp "$tmp/www/rabbit.mp4" "$tmp/www/rabbit3.mp4"
+printf '<!doctype html><title>Stop test</title><video src="rabbit.mp4"></video><video src="rabbit3.mp4"></video>\n' \
+  >"$tmp/www/stop.html"
 port=18780
 export DL_UPDATE_URL=http://127.0.0.1:$port/setup.sh
 printf '#!/bin/sh\necho ran >>"%s/setup-runs"\nsha256sum <"$0" | cut -d" " -f1 >"$DL_DIR/.logs/.setup"\n' "$tmp" \
@@ -59,10 +65,14 @@ trap 'kill $server; pkill -f "$tmp"; pkill -f "$here/dl --work"; rm -rf "$tmp"' 
 # Alpine's BusyBox has nohup, pgrep and pkill; Ubuntu's doesn't, so those come from the system.
 # aria2c and yt-dlp are slowed down so a download is still running when the checks look at it.
 mkdir "$tmp/bin"
-for tool in busybox sh awk base64 cat cut date dd du find grep head ls mkdir mv od rm rmdir sed seq setsid sha256sum sleep sort tail timeout tr wc; do
+for tool in busybox sh awk base64 cat cp cut date dd du find grep head ls mkdir mv od rm rmdir sed seq setsid sha256sum sleep sort tail timeout tr wc; do
   ln -s "$(command -v busybox)" "$tmp/bin/$tool"
 done
-for tool in nohup pgrep pkill kill curl; do ln -s "$(command -v $tool)" "$tmp/bin/$tool"; done
+for tool in nohup pgrep pkill kill curl ffmpeg; do ln -s "$(command -v $tool)" "$tmp/bin/$tool"; done
+# The menus' pictures, as setup installs them.
+export DL_ICONS="$tmp/icons"
+mkdir "$DL_ICONS"
+for f in "$here"/icons/*.png; do name=${f##*/}; base64 -w 0 "$f" >"$DL_ICONS/${name%.png}.b64"; done
 printf '#!/bin/sh\nexec %s --max-overall-download-limit=50K "$@"\n' "$(command -v aria2c)" >"$tmp/bin/aria2c"
 printf '#!/bin/sh\nexec %s --limit-rate 25K "$@"\n' "$(command -v yt-dlp)" >"$tmp/bin/yt-dlp"
 chmod +x "$tmp/bin/aria2c" "$tmp/bin/yt-dlp"
@@ -88,7 +98,8 @@ VIDEO_PAGE=http://127.0.0.1:$port/video.html                                    
 TEXT_PAGE=http://127.0.0.1:$port/text.html                                                      #7
 YOUTUBE=https://www.youtube.com/watch?v=aqz-KE-bpKQ                                             #8
 PLAYLIST_PAGE=http://127.0.0.1:$port/playlist.html                                              #9
-SLOW_PAGE=http://127.0.0.1:$port/slow.html                                                      #10
+STOP_PLAYLIST=http://127.0.0.1:$port/stop.html                                                  #10
+SLOW_PAGE=http://127.0.0.1:$port/slow.html                                                      #11
 
 out=$(dl -s)
 check "empty list" "$out" "No downloads yet."
@@ -135,10 +146,10 @@ case $out in Started*) echo "FAIL  the same YouTube video with a si= tag became 
 check "versions" "$(dl -v)" "Tools last updated: "
 [ "$(cat "$tmp/setup-runs" 2>/dev/null)" = ran ] && echo "ok    the daily update runs the repository's setup" ||
   { echo "FAIL  setup from the repository didn't run once: $(cat "$tmp/setup-runs" 2>/dev/null)"; fails=$((fails + 1)); }
-update_and_wait() {
+update_and_wait() {  # dl -u: the tools, then aria2 itself
   dl -u >/dev/null
   sleep 1
-  for try in $(seq 30); do [ -d "$DL_DIR/.logs/.updating" ] || break; sleep 1; done
+  for try in $(seq 60); do pgrep -f "$here/dl --update" >/dev/null || break; sleep 1; done
 }
 update_and_wait
 [ "$(wc -l <"$tmp/setup-runs")" = 1 ] && echo "ok    an unchanged setup isn't run again" ||
@@ -208,62 +219,158 @@ check "a finished playlist says how many videos" "$(line_for '#9')" "✅ 📃 Ra
   echo "ok    the playlist's folder moves to the shared folder" ||
   { echo "FAIL  playlist folder not moved"; find "$DL_DIR" "$DL_SHARE"; fails=$((fails + 1)); }
 
-# The Shortcut's screens (dl -ui): what it shows after each tap.
+# The Shortcut's screens (dl -ui): what it shows after each tap. The shortcut from before
+# pictures sends no -k and gets plain lines; tap picks the line that contains $1.
 ui() { dl -ui -b "$(b64 "$1")"; }
-tap() { ui "$(printf '%s\n' "$screen" | grep -F -- "$1" | head -n 1)"; }  # tap the line containing $1
+tap() { ui "$(printf '%s\n' "$screen" | grep -F -- "$1" | head -n 1)"; }
+ok() { echo "ok    $1"; }
+fail() { echo "FAIL  $1"; fails=$((fails + 1)); }
+wait_updates() {
+  sleep 1
+  for try in $(seq 60); do pgrep -f "$here/dl --update" >/dev/null || break; sleep 1; done
+}
+
+# A playlist to stop part-way, once its first video is in (see below).
+dl "$STOP_PLAYLIST" >/dev/null
+
 screen=$(ui @@start)
 check "ui: the main menu comes first" "$(printf '%s\n' "$screen" | head -n 1)" "📥 Downloads · "
-check "ui: main menu offers the Downloads folder" "$screen" "📂 Open the Downloads folder"
+check "ui: the main menu offers the Downloads folder" "$screen" "📂 Downloads folder · Open it in Files"
+check "ui: the main menu has Settings" "$screen" "⚙️ Settings · Notifications off · automatic updates"
+case $screen in *'📲'* | *'🔧'* | *'❌'*) fail "ui: the main menu still has what moved to Settings: $screen" ;;
+  *) ok "ui: the main menu is down to 4 rows" ;; esac
 check "ui: Open the Downloads folder gives a Files link" "$(tap '📂')" "shareddocuments://$DL_SHARE"
-check "ui: Close" "$(tap '❌')" "@@exit"
 check "ui: Add link from clipboard" "$(tap '➕')" "@@clipboard"
-check "ui: Open iSH-AOK" "$(tap '📲')" "@@app"
+
+screen=$(tap '⚙️ Settings')
+check "ui: Settings starts with Back" "$(printf '%s\n' "$screen" | head -n 1)" "⬅️ Back"
+check "ui: Settings: notifications" "$screen" "🔕 Notifications · Off · tap to set up"
+check "ui: Settings: aria2's own updates" "$screen" "⬆️ aria2 and its shortcut · Up to date · checked "
+check "ui: Settings: the tools' updates, separately" "$screen" "🔧 Tools: yt-dlp, aria2, ffmpeg · Updated "
+check "ui: Settings: open iSH-AOK" "$(tap '📲')" "@@app"
 mkdir "$DL_DIR/.logs/.updating"
-printf '=== update now\n=== step 1 Alpine packages\n=== step 2 yt-dlp\n' >>"$DL_DIR/.logs/.update.log"
-check "ui: an update shows its progress" "$(ui '')" "🔧 Updating · 2 of 3: yt-dlp ▰▰▰▱▱▱▱▱▱▱"
+printf '=== update now\n=== step 1 Alpine packages\n=== step 2 yt-dlp\n' >"$DL_DIR/.logs/.update.log"
+check "ui: a tools update shows its progress" "$(ui '')" "🔧 Tools: yt-dlp, aria2, ffmpeg · Updating · 2 of 2: yt-dlp ▰▰▰▰▰▱▱▱▱▱"
 rmdir "$DL_DIR/.logs/.updating"
+echo '# newer still' >>"$tmp/www/setup.sh"
+screen=$(ui '')
+check "ui: updating the tools" "$(tap '🔧 Tools')" "ℹ️ Updating the tools · Tap 🔧 again"
+wait_updates
+[ "$(wc -l <"$tmp/setup-runs")" = 2 ] && ok "updating the tools leaves dl and the shortcut alone" ||
+  fail "the tools update ran the setup"
+screen=$(ui '')
+check "ui: checking for a new aria2" "$(tap '⬆️ aria2')" "ℹ️ Checking for a new version"
+wait_updates
+[ "$(wc -l <"$tmp/setup-runs")" = 3 ] && ok "...which runs the new setup" ||
+  fail "aria2's update didn't run the new setup: $(cat "$tmp/setup-runs")"
+screen=$(ui '')
+screen=$(tap '🔁 Automatic updates')
+check "ui: automatic updates can be turned off" "$screen" "🔁 Automatic updates · Off"
+[ -e "$DL_DIR/.logs/.no-auto-update" ] && ok "...and they are" || fail "no .no-auto-update"
+screen=$(tap '🔁 Automatic updates')
+check "ui: ...and back on" "$screen" "🔁 Automatic updates · On"
+check "ui: Back from Settings" "$(tap '⬅️ Back')" "📥 Downloads"
 
 dl "$SLOW_PAGE" >/dev/null
 screen=$(ui @@start)
 screen=$(tap '📥 Downloads')
 check "ui: the list starts with Back" "$(printf '%s\n' "$screen" | head -n 1)" "⬅️ Back"
 finished=$(printf '%s\n' "$screen" | grep -c -E '^(✅|⚠️) ')
-[ "$finished" -le 6 ] && echo "ok    ui: the list keeps at most 6 finished downloads" ||
-  { echo "FAIL  ui: $finished finished downloads listed"; fails=$((fails + 1)); }
+[ "$finished" -le 6 ] && ok "ui: the list keeps at most 6 finished downloads" ||
+  fail "ui: $finished finished downloads listed"
+case $screen in *' #'[0-9]*) fail "ui: the list still shows numbers: $screen" ;; *) ok "ui: no numbers in the list" ;; esac
+check "ui: a finished video, without .mp4" "$screen" "✅ Rabbit test page (1) · Downloaded · "
 check "ui: tapping a finished download opens it in Files" "$(tap '✅ Rabbit test page')" \
   "shareddocuments://$DL_SHARE/Rabbit%20test%20page%20%281%29.mp4"
-for try in $(seq 40); do line_for '#10' | grep -q '% · ' && break; sleep 1; done
+for try in $(seq 40); do line_for '#11' | grep -q '% · ' && break; sleep 1; done
 screen=$(ui '')
 screen=$(tap 'Slow page')
-check "ui: tapping a running download shows its screen" "$screen" "⏸ Pause
-⏹ Stop and delete"
-ls "$DL_DIR" | grep -q '^Slow page.*\.part$' && echo "ok    the slow video is part-way" ||
-  { echo "FAIL  no partial file for the slow video"; ls "$DL_DIR"; fails=$((fails + 1)); }
+check "ui: tapping a running download shows its screen" "$screen" "⏸ Pause · Resume it any time
+⏹ Stop and delete · Deletes what it downloaded so far"
+ls "$DL_DIR" | grep -q '^Slow page.*\.part$' && ok "the slow video is part-way" ||
+  { fail "no partial file for the slow video"; ls "$DL_DIR"; }
 screen=$(tap '⏹ Stop and delete')
 check "ui: stopping says so, back on the list" "$screen" "ℹ️ Stopped Slow page"
-printf '%s\n' "$screen" | grep 'Slow page' | grep -q ' #[0-9]' &&
-  { echo "FAIL  ui: the stopped download is still listed"; fails=$((fails + 1)); } ||
-  echo "ok    ui: the stopped download leaves the list"
-ls "$DL_DIR" | grep -q '^Slow page' && { echo "FAIL  stop left files behind"; ls "$DL_DIR"; fails=$((fails + 1)); } ||
-  echo "ok    stop deletes the partial files"
+check "ui: ...and that it deleted it" "$(printf '%s\n' "$screen" | head -n 1)" " · Deleted what it had downloaded"
+printf '%s\n' "$screen" | grep -q -E '^(⬇️|⏳|⏸|✅|⚠️) Slow page' && fail "ui: the stopped download is still listed" ||
+  ok "ui: the stopped download leaves the list"
+ls "$DL_DIR" | grep -q '^Slow page' && { fail "stop left files behind"; ls "$DL_DIR"; } ||
+  ok "stop deletes the partial files"
 screen=$(tap 'Nobody Shares This')
 screen=$(tap '⏹ Stop and delete')
 check "ui: stopping a magnet" "$screen" "ℹ️ Stopped Nobody Shares This"
+
+# Stopping a playlist part-way keeps the videos it finished.
+for try in $(seq 120); do line_for '#10' | grep -q 'video 2 of 2 · [0-9]' && break; sleep 1; done
+screen=$(ui '')
+screen=$(tap 'Stop test')
+check "ui: a playlist part-way offers to stop, keeping what it finished" "$screen" \
+  "⏹ Stop here · Keeps the 1 finished video(s)"
+screen=$(tap '⏹ Stop here')
+check "ui: stopping a playlist part-way" "$screen" "ℹ️ Stopped Stop test · Kept the 1 video(s) it had finished"
+check "ui: it stays on the list, as stopped" "$screen" "✅ Stop test · Stopped · 1 of 2 videos"
+[ "$(ls "$DL_SHARE/Stop test" 2>/dev/null | grep -c '\.mp4$')" = 1 ] && ok "its finished video is in Files" ||
+  { fail "the stopped playlist's video isn't in Files"; find "$DL_SHARE" "$DL_DIR" -name '*Stop*'; }
+find "$DL_DIR" -path '*Stop test*' | grep -q . && { fail "the stopped playlist left files behind"; find "$DL_DIR" -path '*Stop test*'; } ||
+  ok "the video it was on is deleted"
 check "ui: Back goes to the main menu" "$(tap '⬅️ Back')" "📥 Downloads"
 
-# Notifications, through the stand-in for Bark's server.
-[ ! -e "$tmp/bark.log" ] && echo "ok    no notifications before they're turned on" ||
-  { echo "FAIL  notifications were sent while they were off"; fails=$((fails + 1)); }
+# The shortcut with pictures (-k <its version>) gets vCards, and taps come back as titles.
+uik() { dl -ui -b "$(b64 "$1")" -k oldver0; }
+cards=$(uik @@start)
+check "cards: the main menu is vCards" "$(printf '%s\n' "$cards" | head -n 1)" "BEGIN:VCARD"
+check "cards: a row's title" "$cards" "N;CHARSET=utf-8:Downloads;;;;"
+check "cards: a row's line under the title" "$cards" "ORG;CHARSET=utf-8:Copy a link\, then tap here;"
+check "cards: with a picture" "$cards" "PHOTO;ENCODING=b:iVBORw0KGgo"
+[ "$(printf '%s\n' "$cards" | grep -c '^BEGIN:VCARD$')" = 4 ] && [ "$(printf '%s\n' "$cards" | grep -c '^END:VCARD$')" = 4 ] &&
+  ok "cards: one vCard per row" || fail "cards: vCards don't add up: $cards"
+check "cards: opening the Downloads folder" "$(uik 'Downloads folder')" "@@open:shareddocuments://$DL_SHARE"
+cards=$(uik Settings)
+check "cards: tapping a title" "$cards" "N;CHARSET=utf-8:Pictures in menus;;;;"
+check "cards: the plain lines' setting is there too" "$(uik 'Pictures in menus')" "🖼 Pictures in menus · Off"
+check "cards: ...and turns back on" "$(dl -ui -b "$(b64 '🖼 Pictures in menus · Off')" -k oldver0)" "N;CHARSET=utf-8:Pictures in menus;;;;"
+uik Back >/dev/null
+cards=$(uik Downloads)
+check "cards: a finished video shows its own picture" "$cards" "PHOTO;ENCODING=b:/9j/"
+check "cards: a stopped playlist" "$cards" "ORG;CHARSET=utf-8:Stopped · 1 of 2 videos"
+printf 'https://example.com/x\n=== start\n=== via aria2\nFILE: %s/Hello, world; again.txt\n=== exit 0\n' "$DL_DIR" \
+  >"$DL_DIR/.logs/50.log"
+cards=$(uik '')
+check "cards: commas and semicolons are escaped" "$cards" 'N;CHARSET=utf-8:Hello\, world\; again.txt;;;;'
+check "cards: and tapping that title finds it" "$(uik 'Hello, world; again.txt')" "N;CHARSET=utf-8:It's in iSH-AOK's own Downloads folder;;;;"
+dl -ui -b "$(b64 '')" -k oldver0 >/dev/null
+rm -f "$DL_DIR/.logs/50.log"
+
+# A new shortcut from an update: setup leaves it in Files and says where in .pending.
+printf 'AEA1 pretend signed shortcut' >"$DL_SHORTCUTS/aria2.shortcut"
+cp "$DL_SHORTCUTS/aria2.shortcut" "$DL_SHARE/aria2.shortcut"
+echo newver1 >"$DL_SHORTCUTS/.version"
+echo "$DL_SHARE/aria2.shortcut" >"$DL_SHORTCUTS/.pending"
+check "ui: the old shortcut opens the new one in Files when it opens" "$(ui @@start)" "shareddocuments://$DL_SHARE/aria2.shortcut"
 screen=$(ui @@start)
-check "ui: the main menu offers notifications" "$screen" "🔔 Turn on notifications"
-screen=$(tap '🔔')
-check "ui: the notifications screen says how to turn them on" "$screen" "2️⃣ In Bark, tap the copy button"
+check "ui: just once; then the main menu offers it" "$(printf '%s\n' "$screen" | head -n 1)" "🆕 New aria2 shortcut · Tap to install it, then tap Replace"
+check "ui: tapping that opens it again" "$(tap '🆕')" "shareddocuments://$DL_SHARE/aria2.shortcut"
+uik '' >/dev/null
+check "cards: a shortcut with pictures imports the new one itself" "$(uik 'New aria2 shortcut')" "@@import"
+check "dl --shortcut prints it" "$(dl --shortcut | base64 -d)" "AEA1 pretend signed shortcut"
+out=$(dl -ui -b "$(b64 @@start)" -k newver1)
+case $out in *'New aria2 shortcut'*) fail "the new shortcut is offered to itself" ;;
+  *) ok "once the new shortcut runs, it's no longer offered" ;; esac
+[ ! -e "$DL_SHORTCUTS/.pending" ] && ok "...and .pending is gone" || fail ".pending still there"
+
+# Notifications, through the stand-in for Bark's server.
+[ ! -e "$tmp/bark.log" ] && ok "no notifications before they're turned on" ||
+  fail "notifications were sent while they were off"
+screen=$(ui @@start)
+screen=$(tap '⚙️ Settings')
+screen=$(tap '🔕 Notifications')
+check "ui: the notifications screen says how to turn them on" "$screen" "2️⃣ In Bark, copy a link"
 check "ui: 3️⃣ reads the clipboard" "$(tap '3️⃣')" "@@clipboard"
 before=$(ls "$DL_DIR/.logs" | grep -c '\.log$')
 out=$(dl -b "$(b64 "$SMALL?copied-by-mistake")")
 check "after 3️⃣, the clipboard has to have a Bark link" "$out" "There's no Bark link on the clipboard."
-[ "$(ls "$DL_DIR/.logs" | grep -c '\.log$')" = "$before" ] && echo "ok    ...and anything else on it isn't downloaded" ||
-  { echo "FAIL  after 3️⃣, the clipboard's link was downloaded"; fails=$((fails + 1)); }
+[ "$(ls "$DL_DIR/.logs" | grep -c '\.log$')" = "$before" ] && ok "...and anything else on it isn't downloaded" ||
+  fail "after 3️⃣, the clipboard's link was downloaded"
 out=$(dl -b "$(b64 "$DL_BARK/WRONGKEY/Push content")")
 check "a Bark link that Bark doesn't take" "$out" "Bark didn't take that link, so notifications are still off."
 out=$(dl -b "$(b64 "Copied from Bark: $DL_BARK/GOODKEY42/Push%20content")")
@@ -272,10 +379,14 @@ check "...and sends a test notification" "$(cat "$tmp/bark.log")" '"title": "�
 screen=$(ui '')
 check "ui: the notifications screen once they're on" "$screen" "🔔 Send a test notification
 🔕 Turn off notifications"
-check "ui: sending a test notification" "$(tap '🔔 Send')" "ℹ️ Sent."
+check "ui: sending a test notification" "$(tap '🔔 Send')" "ℹ️ Sent a test notification"
 check "...which opens the Downloads folder when tapped" "$(tail -n 1 "$tmp/bark.log")" "\"url\": \"shareddocuments://$DL_SHARE\""
 screen=$(tap '⬅️ Back')
-check "ui: the main menu says they're on" "$screen" "🔔 Notifications · on"
+check "ui: Settings says they're on" "$screen" "🔔 Notifications · On: one when a download finishes"
+check "ui: so does the main menu" "$(tap '⬅️ Back')" "⚙️ Settings · Notifications on"
+check "cards: Get Bark opens the App Store" "$(dl -ui -b "$(b64 '')" -k oldver0 >/dev/null; dl -ui -b "$(b64 Settings)" -k oldver0 >/dev/null; mv "$DL_DIR/.logs/.bark" "$DL_DIR/.logs/.bark.keep"; dl -ui -b "$(b64 Notifications)" -k oldver0 >/dev/null; dl -ui -b "$(b64 'Get Bark')" -k oldver0)" \
+  "@@open:https://apps.apple.com/app/bark-custom-notifications/id1403753865"
+mv "$DL_DIR/.logs/.bark.keep" "$DL_DIR/.logs/.bark"
 
 printf 'hello\n' >"$tmp/www/note.txt"
 printf 'hello\n' >"$tmp/www/say\"hi\".txt"
@@ -290,24 +401,27 @@ check "...saying it's downloaded" "$(notified note.txt)" '"title": "✅ Download
 check "...which opens the file when tapped" "$(notified note.txt)" "\"url\": \"shareddocuments://$DL_SHARE/note.txt\""
 check "a name with quotes in it" "$(notified say)" '"body": "say\"hi\".txt · '
 check "a failed download sends a notification" "$(notified missing.zip)" '"title": "⚠️ Download failed"'
-grep -q '^NOT JSON' "$tmp/bark.log" && { echo "FAIL  a notification wasn't valid JSON"; fails=$((fails + 1)); } ||
-  echo "ok    every notification is valid JSON"
+grep -q '^NOT JSON' "$tmp/bark.log" && fail "a notification wasn't valid JSON" || ok "every notification is valid JSON"
 
-screen=$(tap '🔔')
+screen=$(ui @@start)
+screen=$(tap '⚙️ Settings')
+screen=$(tap '🔔 Notifications')
 screen=$(tap '🔕')
-check "ui: turning notifications off" "$screen" "ℹ️ Notifications are off."
-[ ! -e "$DL_DIR/.logs/.bark" ] && echo "ok    ...and they are" || { echo "FAIL  .bark still there"; fails=$((fails + 1)); }
+check "ui: turning notifications off" "$screen" "ℹ️ Notifications are off"
+[ ! -e "$DL_DIR/.logs/.bark" ] && ok "...and they are" || fail ".bark still there"
 screen=$(tap '🔔 Turn notifications back on')
 check "ui: turning them back on" "$screen" "🔕 Turn off notifications"
 screen=$(tap '🔕')
-check "ui: Back from notifications" "$(tap '⬅️ Back')" "🔔 Turn on notifications"
+check "ui: Back from notifications goes to Settings" "$(tap '⬅️ Back')" "🔕 Notifications · Off · tap to set up"
 
 dl -p >/dev/null
 out=$(act "🧹 Clear finished")
-check "clear finished" "$out" "finished download(s). The files are still in Downloads."
+check "clear finished" "$out" "finished download(s)
+The files are still in Downloads"
 out=$(dl -s)
-case $out in *NEWS* | *NOPE_404* | *Rabbit*) echo "FAIL  cleared downloads still listed"; fails=$((fails + 1)) ;;
-  *) echo "ok    cleared downloads leave the list" ;; esac
-[ -e "$DL_SHARE/NEWS" ] && echo "ok    clearing keeps the files" || { echo "FAIL  NEWS was deleted"; fails=$((fails + 1)); }
+case $out in *NEWS* | *NOPE_404* | *Rabbit*) fail "cleared downloads still listed" ;;
+  *) ok "cleared downloads leave the list" ;; esac
+[ -e "$DL_SHARE/NEWS" ] && ok "clearing keeps the files" || fail "NEWS was deleted"
+ls "$DL_DIR/.logs" | grep -q '\.thumb$' && fail "pictures of cleared downloads are left behind" || ok "clearing removes their pictures"
 
 [ "$fails" = 0 ] && echo "All checks passed." || { echo "$fails check(s) failed."; exit 1; }

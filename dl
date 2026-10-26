@@ -9,7 +9,7 @@
 #   dl -m                 those lines plus the actions: the Shortcut's menu
 #   dl -a -b <base64>     do what a chosen menu line says (a download line pauses or resumes it)
 #   dl -p | -r | -c       pause all, resume all, clear finished from the list (files stay)
-#   dl -u | -v            update yt-dlp and the other tools now | show their versions
+#   dl -u | -v            update aria2 and its tools now | show the tools' versions
 #   dl <Bark link>        get a notification when a download ends, through the Bark app
 #
 # Finished downloads land in /root/Downloads, or in /mnt/phone when a Files folder is
@@ -23,6 +23,7 @@ JOBS=$DEST/.logs
 SHARE=${DL_SHARE:-/mnt/phone}
 # Where setup-on-phone.sh keeps the signed shortcut, and where updates come from.
 SHORTCUTS=${DL_SHORTCUTS:-/root/Shortcuts}
+SHORTCUT=  # the version of the Shortcut asking, when it says (dl -ui … -k <version>)
 UPDATE_URL=${DL_UPDATE_URL:-https://raw.githubusercontent.com/moh-aln/aria2-iphone-shortcut/main/shortcuts/setup-on-phone.sh}
 # Notifications go through the Bark app, because iSH-AOK can't post any itself: dl sends
 # them to Bark's server, which pushes them to the phone. They're off until dl is given a
@@ -110,7 +111,7 @@ fetch_file() {
     --show-console-readout=false --summary-interval=5 "$1"
 }
 
-fetch_video() {
+fetch_video() {  # fetch_video <link> <id>
   # The JavaScript engine yt-dlp uses to work out YouTube's video links: Node when it's
   # installed (about 4 times faster than QuickJS in iSH-AOK on an iPhone), else QuickJS.
   js=
@@ -125,9 +126,11 @@ fetch_video() {
   # the step it's on is what the list shows until the download starts.
   # A playlist link downloads the playlist into a folder named after it; a video link that
   # happens to come from a playlist (watch?v=…&list=…) downloads just that video.
+  # Before each video, its picture is fetched in the background for the menus (see thumb).
   yt-dlp --newline --no-playlist --no-mtime -P "$DEST" -o '%(playlist_title|.).80B/%(title).80B.%(ext)s' \
     -f 'bv*[vcodec^=avc1]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b' --merge-output-format mp4 $js \
     --exec 'before_dl:echo NAME: %(title)q' --exec 'after_move:echo FILE: %(filepath)q' \
+    --exec "before_dl:sh '$0' --thumb $2 %(thumbnail)q >/dev/null 2>&1 &" \
     --progress-template 'download:[#yt %(progress._downloaded_bytes_str)s/%(progress._total_bytes_str)s(%(progress._percent_str)s) DL:%(progress._speed_str)s ETA:%(progress._eta_str)s]' \
     "$1"
 }
@@ -148,7 +151,7 @@ work() {  # work <id>: the background worker, for as long as the download takes
   # Run the tool as a child, so that without setsid a pause still reaches it.
   child=
   trap 'kill $child 2>/dev/null' TERM
-  if [ $tool = yt-dlp ]; then fetch_video "$link" & else fetch_file "$link" & fi
+  if [ $tool = yt-dlp ]; then fetch_video "$link" "$1" & else fetch_file "$link" & fi
   child=$!
   wait $child
   code=$?
@@ -163,53 +166,90 @@ work() {  # work <id>: the background worker, for as long as the download takes
   rest_unless_busy "$1"
 }
 
+# thumb <id> <picture link>: a small square of the video's picture, base64, for the menus.
+thumb() {
+  case $2 in http*) ;; *) return 0 ;; esac
+  command -v ffmpeg >/dev/null || return 0
+  # YouTube's best picture is large; the 320x180 one is plenty.
+  url=$(printf %s "$2" | sed -E 's|^https?://i\.ytimg\.com/vi(_webp)?/([^/]+)/.*|https://i.ytimg.com/vi/\2/mqdefault.jpg|')
+  tmp=$JOBS/$1.thumb.$$
+  timeout 60 curl -fsSL -m 50 -o "$tmp.src" "$url" &&
+    timeout 60 ffmpeg -nostdin -loglevel error -y -i "$tmp.src" -frames:v 1 -q:v 5 \
+      -vf 'scale=96:96:force_original_aspect_ratio=increase,crop=96:96' "$tmp.jpg" &&
+    base64 "$tmp.jpg" | tr -d '\n' >"$tmp" && mv -f "$tmp" "$JOBS/$1.thumb"
+  rm -f "$tmp" "$tmp.src" "$tmp.jpg"
+}
+
 segment() { # segment <id>: the log since the download's latest (re)start
   awk '/^=== start/ { buf = "" } { buf = buf $0 "\n" } END { printf "%s", buf }' "$JOBS/$1.log"
 }
 
-# Tools are updated at most once a day, by the worker of a download that just ended:
-# yt-dlp from its own releases (YouTube changes often, and Alpine's package lags behind),
-# the rest from Alpine, and dl itself (with the shortcut) from the project's repository.
-# "🔧 Update tools" in the menu does it at once.
+# Two kinds of update, each at most once a day after a download ends, and when the Shortcut
+# opens (see auto_update), unless automatic updates are off in Settings:
+#   tools: yt-dlp from its own releases (YouTube changes often, and Alpine's package lags
+#          behind), the rest from Alpine
+#   app:   dl itself, its pictures and the shortcut, from the project's repository
+# Settings has a row for each that does it at once.
 update_tools() {
   echo "=== update $(date)"
-  # "=== step N <what>" lines are what the menu shows while this runs.
+  # "=== step N <what>" lines are what Settings shows while this runs.
   echo "=== step 1 Alpine packages"
   timeout 600 apk update -q && timeout 1800 apk add -q -u aria2 curl ffmpeg nodejs quickjs
   echo "=== step 2 yt-dlp"
   case $(command -v yt-dlp) in /usr/local/bin/*) timeout 600 yt-dlp -U ;; esac
-  # The setup script installs dl and, when it changed, a new signed shortcut. Run the
-  # repository's copy only when it differs from the one last run here.
-  echo "=== step 3 dl and the shortcut"
-  if timeout 120 curl -fsSL -o "$JOBS/.setup.new" "$UPDATE_URL" &&
-      [ "$(sha256sum <"$JOBS/.setup.new" | cut -d' ' -f1)" != "$(cat "$JOBS/.setup" 2>/dev/null)" ]; then
-    echo "=== new setup"
-    sh "$JOBS/.setup.new"
-  fi
-  rm -f "$JOBS/.setup.new"
+  yt-dlp --version >"$JOBS/.yt-dlp-version" 2>/dev/null
   date +%s >"$JOBS/.updated"
   echo "=== updated"
 }
 
-update_now() {
-  # One update at a time; a lock older than an hour was left by an update iOS ended.
-  find "$JOBS" -maxdepth 1 -name .updating -mmin +60 -exec rmdir {} \; 2>/dev/null
-  mkdir "$JOBS/.updating" 2>/dev/null || return 0
-  update_tools >>"$JOBS/.update.log" 2>&1
-  rmdir "$JOBS/.updating"
+# The setup script installs dl, its pictures and, when it changed, a new signed shortcut.
+# Run the repository's copy only when it differs from the one last run here.
+update_app() {
+  echo "=== check $(date)"
+  date +%s >"$JOBS/.app-checked"
+  if timeout 120 curl -fsSL -o "$JOBS/.setup.new" "$UPDATE_URL" &&
+      [ "$(sha256sum <"$JOBS/.setup.new" | cut -d' ' -f1)" != "$(cat "$JOBS/.setup" 2>/dev/null)" ]; then
+    echo "=== new version"
+    # Only dl and the shortcut: the tools have their own update.
+    DL_APP_ONLY=1 sh "$JOBS/.setup.new"
+  fi
+  rm -f "$JOBS/.setup.new"
+  echo "=== checked"
 }
 
-update_if_due() {
-  last=$(cat "$JOBS/.updated" 2>/dev/null)
-  [ $(($(date +%s) - ${last:-0})) -ge 86400 ] && update_now
+update_now() {  # update_now tools | app
+  lock=$JOBS/.updating log=$JOBS/.update.log
+  [ "$1" = app ] && lock=$JOBS/.app-updating log=$JOBS/.app-update.log
+  # One of each at a time; a lock older than an hour was left by an update iOS ended.
+  find "$JOBS" -maxdepth 1 -name "${lock##*/}" -mmin +60 -exec rmdir {} \; 2>/dev/null
+  mkdir "$lock" 2>/dev/null || return 0
+  if [ "$1" = app ]; then update_app; else update_tools; fi >"$log" 2>&1
+  rmdir "$lock"
 }
 
-update_progress() {  # e.g. "Updating · 2 of 3: yt-dlp ▰▰▰▱▱▱▱▱▱▱"
+update_in_background() {  # update_in_background tools | app | both
+  $(command -v setsid) nohup sh "$0" --update "$1" >/dev/null 2>&1 </dev/null &
+}
+
+due() {  # due <file with a time> <seconds>: has that long passed since?
+  last=$(cat "$1" 2>/dev/null)
+  [ $(($(date +%s) - ${last:-0})) -ge "$2" ]
+}
+
+auto_updates() { [ ! -e "$JOBS/.no-auto-update" ]; }
+
+update_if_due() {  # after a download
+  auto_updates || return 0
+  due "$JOBS/.updated" 86400 && update_now tools
+  due "$JOBS/.app-checked" 86400 && update_now app
+}
+
+update_progress() {  # e.g. "Updating · 2 of 2: yt-dlp ▰▰▰▰▰▱▱▱▱▱"
   now=$(awk '/^=== update/ { s = "" } /^=== step / { s = $3 " " substr($0, index($0, $4)) } END { print s }' \
     "$JOBS/.update.log" 2>/dev/null)
   n=${now%% *}
-  case $n in 1 | 2 | 3) ;; *) n=1 now="1 starting" ;; esac
-  echo "Updating · $n of 3: ${now#* } $(bar $(((n - 1) * 33)))"
+  case $n in 1 | 2) ;; *) n=1 now="1 starting" ;; esac
+  echo "Updating · $n of 2: ${now#* } $(bar $(((n - 1) * 50)))"
 }
 
 versions() {
@@ -271,14 +311,18 @@ link_name() {
   printf %s "${n:-$1}"
 }
 
-# load <id>: sets link, state (running, paused, done or failed), name, path, pct, speed, eta, reason.
+# load <id>: sets link, state (running, paused, done or failed), name, path, pct, speed, eta,
+# reason and via (the tool), and for a playlist: playlist, n, total, overall, videos, errors
+# and stopped (it was stopped part-way, keeping the videos it had finished).
 load() {
   link=$(head -n 1 "$JOBS/$1.log")
   # Only the output since the latest (re)start counts.
   seg=$(segment "$1")
   code=$(printf '%s\n' "$seg" | sed -n 's/^=== exit //p' | tail -n 1)
-  reason=
+  reason= stopped= playlist= overall= n= total= videos=0 errors=0 prep= label=
+  case $seg in *'=== via yt-dlp'*) via=yt-dlp ;; *) via=aria2 ;; esac
   case $seg in
+    *'=== stopped'*) state=done stopped=1 ;;
     *'=== paused'*) state=paused ;;
     *'=== exit '*)
       if [ "$code" = 0 ]; then state=done; else state=failed; fi
@@ -418,7 +462,12 @@ add() {  # add <link>: start it, or resume it if it's already in the list
     load "$id"
     case $state in
       running) echo "Already downloading: $name" ;;
-      done) echo "Already downloaded: $name (clear finished to download it again)" ;;
+      done)
+        if [ -n "$stopped" ]; then
+          echo "You stopped $playlist part-way. To download it again, remove it from the list first."
+        else
+          echo "Already downloaded: $name (clear finished to download it again)"
+        fi ;;
       *) start "$1" "$id"; echo "Resumed: $name" ;;
     esac
     return
@@ -485,6 +534,7 @@ json_text() { printf %s "$1" | tr -d '\001-\037' | sed 's/\\/\\\\/g; s/"/\\"/g';
 # when tapped, and one when it fails. None for a pause.
 announce() {  # announce <id>
   [ -s "$JOBS/.bark" ] || return 0
+  segment "$1" | grep -q '^=== paused' && return 0  # paused, or being stopped
   load "$1"
   case $state in
     done)
@@ -527,36 +577,37 @@ toggle() {  # toggle <id>
 }
 
 pause_all() {
-  n=0
+  count=0
   for id in $(ids); do
     # By state, not by worker: a finished download's worker may still be updating tools.
     load "$id"
     [ "$state" = running ] || continue
     pause "$id"
-    n=$((n + 1))
+    count=$((count + 1))
   done
   rest_unless_busy
-  if [ $n = 0 ]; then echo "Nothing is downloading."; else echo "Paused all downloads."; fi
+  if [ $count = 0 ]; then echo "Nothing is downloading."; else echo "Paused all downloads."; fi
 }
 
 resume_all() {
-  n=0
+  count=0
   for id in $(ids); do
     load "$id"
     [ "$state" = paused ] || continue
     start "$link" "$id"
-    n=$((n + 1))
+    count=$((count + 1))
   done
-  echo "Resumed $n download(s)."
+  echo "Resumed $count download(s)."
 }
 
 clear_finished() {
-  n=0
+  count=0
   for id in $(ids); do
     load "$id"
-    case $state in done | failed) rm -f "$JOBS/$id.log" "$JOBS/$id.pid"; n=$((n + 1)) ;; esac
+    case $state in done | failed) forget "$id"; count=$((count + 1)) ;; esac
   done
-  echo "Cleared $n finished download(s). The files are still in Downloads."
+  echo "Cleared $count finished download(s)"
+  echo "The files are still in Downloads"
 }
 
 # dl -m and dl -a are the menu of the first single shortcut, kept for phones that haven't
@@ -584,92 +635,319 @@ act() {  # act <chosen menu line>
     *'Pause all') pause_all ;;
     *'Resume all') resume_all ;;
     *'Clear finished') clear_finished ;;
-    *'Update tools') update_in_background ;;
+    *'Update tools') update_in_background both; echo "Updating aria2 and its tools in the background." ;;
     '🆕'*) rm -f "$SHORTCUTS/.pending"; echo "Done." ;;
     *) ;;  # Refresh: the Shortcut shows the list again anyway
   esac
 }
 
-update_in_background() {
-  $(command -v setsid) nohup sh "$0" --update >/dev/null 2>&1 </dev/null &
-  echo "Updating yt-dlp and the other tools in the background."
-}
-
 # ---- The Shortcut's screens ----
 #
-# The Shortcut runs `dl -ui -b '<the line tapped, base64>'` again and again and shows what
-# it prints as a list to tap: "@@start" when it opens, and nothing after it handled a tap
-# itself. A few answers it acts on instead of showing them:
-#   shareddocuments://…   opens that file or folder in the Files app
-#   @@clipboard           adds the link on the clipboard
-#   @@app                 opens iSH-AOK
-#   @@exit                closes
-# So every screen lives here, and changing one never needs a new shortcut. The screen on
-# show is kept in $JOBS/.screen ("main", "list" or "item <id>"), and a message for the
-# next screen in $JOBS/.notice.
+# The Shortcut runs `dl -ui -b '<what was tapped, base64>' -k <its version>` again and again,
+# and shows what it prints. It sends "@@start" when it opens, and nothing after it handled
+# a tap itself. A few answers it acts on instead of showing them:
+#   @@open:<link>   opens the link: a file or folder in Files, or the App Store
+#   @@import        runs `dl --shortcut` and opens the file it prints, the new shortcut, so
+#                   that iOS offers to import it
+#   @@clipboard     adds the link on the clipboard
+#   @@app           opens iSH-AOK
+#   @@exit          closes
+# Anything else is a screen of rows: vCards, which Choose from List shows as contacts, each
+# with a picture, a title and a line under it (the "vCard menu" trick, as in Cherri's
+# chooseFromVCard), or plain lines when pictures are off. What comes back is what the row
+# showed: a vCard's title, or the whole line. So every screen lives here, and changing one
+# never needs a new shortcut.
+#
+# The shortcut from before pictures (c819f7f3) sends no -k. It gets plain lines, opens only
+# shareddocuments:// links as they are, and knows no @@import.
+#
+# Kept in $JOBS: .screen (main, list, "item <id>", settings or notifications), .menu (one
+# line per row on show: its key, a tab, then what it showed) and .notice (a message for the
+# next screen: a title line, then a detail line).
 
 KEEP_FINISHED=6  # finished downloads the list keeps; older ones drop off it (files stay)
+ICONS=${DL_ICONS:-/usr/local/share/dl/icons}  # the pictures, base64 PNGs, from setup
+BARK_APP=https://apps.apple.com/app/bark-custom-notifications/id1403753865
 
-ui() {  # ui <tapped line>
+ui() {  # ui <what was tapped>
   screen=$(cat "$JOBS/.screen" 2>/dev/null)
   case $1 in
-    @@start) screen=main ;;
+    @@start) screen=main; opening || return 0 ;;
     '') ;;
-    *) tapped "$1" || return 0 ;;
+    *) tapped "$(row_key "$1")" || return 0 ;;
   esac
+  cards=  # pictures, unless they're off or the shortcut can't show them
+  [ -n "$SHORTCUT" ] && [ ! -e "$JOBS/.plain" ] && cards=1
   echo "$screen" >"$JOBS/.screen"
+  rows=$JOBS/.rows.$$
+  : >"$rows"
   if [ -s "$JOBS/.notice" ]; then
-    echo "ℹ️ $(cat "$JOBS/.notice")"
+    { IFS= read -r title; IFS= read -r detail; } <"$JOBS/.notice"
+    row notice ℹ️ "$title" "$detail"
     : >"$JOBS/.notice"
   fi
   case $screen in
     list) list_screen ;;
     item\ *) item_screen "${screen#item }" ;;
+    settings) settings_screen ;;
     notifications) notifications_screen ;;
     *) main_screen ;;
   esac
+  render <"$rows"
+  rm -f "$JOBS/.rows.$$"
 }
 
-notice() { printf '%s\n' "$1" >"$JOBS/.notice"; }
+row() {  # row <key> <emoji> <title> [<detail> [<picture>]]: add a row to the screen
+  printf '%s\037%s\037%s\037%s\037%s\n' "$1" "$2" "$3" "$4" "$5" >>"$rows"
+}
+
+notice() { printf '%s\n%s\n' "$1" "$2" >"$JOBS/.notice"; }  # notice <title> [<detail>]
+
+# Prints the rows as vCards or lines, and keeps what each showed in .menu. Rows have to
+# read differently from each other, because what was tapped is all that comes back.
+render() {
+  awk -F '\037' -v cards="$cards" -v icons="$ICONS" -v menu="$JOBS/.menu" '
+    BEGIN {
+      # The picture for each emoji, unless the row names one.
+      n = split("⬅️ back 📥 downloads ⬇️ downloads ➕ add 📂 folder 📦 folder ⚙️ settings 🆕 new " \
+        "🔔 bell 🔕 belloff ⬆️ update 🔧 tools 📲 app ⏸ pause ▶️ play ⏹ stop 🔁 retry " \
+        "🔄 refresh 🗑 trash ℹ️ info ✅ done ⚠️ failed 🧹 clear 🖼 pictures ⏳ prep0 " \
+        "1️⃣ appstore 2️⃣ copy 3️⃣ paste", w, " ")
+      for (i = 1; i < n; i += 2) pic[w[i]] = w[i + 1]
+      printf "" > menu
+    }
+    function first(c) { return c < "\200" || c >= "\300" }  # starts a UTF-8 character
+    # s cut to n characters (not bytes: titles are often in other scripts), with "…".
+    function cut(s, n,   i, chars) {
+      for (i = 1; i <= length(s); i++) chars += first(substr(s, i, 1))
+      if (chars <= n) return s
+      chars = 0
+      for (i = 1; i <= length(s); i++)
+        if (first(substr(s, i, 1)) && ++chars == n) break
+      s = substr(s, 1, i - 1)
+      sub(/[ .,:;(-]+$/, "", s)
+      return s "…"
+    }
+    function esc(s,   i, c, out) {  # for a vCard value
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        out = out (c == "\\" || c == "," || c == ";" ? "\\" : "") c
+      }
+      return out
+    }
+    function photo(name,   f, data) {  # a picture by name, or a file of base64 by path
+      f = name ~ /^\// ? name : icons "/" name ".b64"
+      if ((getline data < f) <= 0) data = ""
+      close(f)
+      return data
+    }
+    {
+      key = $1; emoji = $2; title = $3; detail = $4; p = $5
+      gsub(/[[:cntrl:]]/, " ", title); gsub(/[[:cntrl:]]/, " ", detail)
+      title = cut(title, cards ? 38 : 30); detail = cut(detail, cards ? 60 : 40)
+      for (k = 1; ; k++) {
+        t = k == 1 ? title : title " (" k ")"
+        shown = cards ? t : emoji " " t (detail == "" ? "" : " · " detail)
+        if (!(shown in seen)) break
+      }
+      seen[shown] = 1
+      print key "\t" shown > menu
+      if (!cards) { print shown; next }
+      print "BEGIN:VCARD\nVERSION:3.0\nN;CHARSET=utf-8:" esc(t) ";;;;"
+      if (detail != "") print "ORG;CHARSET=utf-8:" esc(detail) ";"
+      data = photo(p == "" ? pic[emoji] : p)
+      if (data != "") print "PHOTO;ENCODING=b:" data
+      print "END:VCARD"
+    }
+    END { close(menu) }'
+}
+
+row_key() {  # row_key <what was tapped>: the key of the row that showed it
+  # If the text comes back changed (escapes or spaces), match it loosely.
+  TAPPED=$1 awk -F '\t' '
+    function plain(s) { gsub(/[\\ ]/, "", s); return tolower(s) }
+    BEGIN { t = ENVIRON["TAPPED"]; p = plain(t) }
+    $2 == t { print $1; exact = 1; exit }
+    loose == "" && plain($2) == p { loose = $1 }
+    END { if (!exact && loose != "") print loose }' "$JOBS/.menu" 2>/dev/null
+}
+
+tapped() {  # tapped <key>: act on the row tapped. Fails after printing an answer for the Shortcut.
+  id=${screen#item }
+  case $1 in
+    '' | notice | self) ;;  # just show the screen again
+    back:*) screen=${1#back:} ;;
+    downloads) screen=list ;;
+    add) echo @@clipboard; return 1 ;;
+    folder) open_link "$(files_url "$SHARE" || echo shareddocuments://)"; return 1 ;;
+    settings) screen=settings ;;
+    import) import_shortcut || return 1 ;;
+    dl:*) open_or_show "${1#dl:}" || return 1 ;;
+    pauseall) notice "$(pause_all)" ;;
+    resumeall) notice "$(resume_all)" ;;
+    clear) notice "$(clear_finished)" ;;
+    pause) pause "$id"; rest_unless_busy ;;
+    resume) load "$id"; start "$link" "$id" ;;
+    stop) notice "$(stop "$id")"; screen=list ;;
+    remove) load "$id"; forget "$id"; notice "Removed from the list" "${playlist:-$name}"; screen=list ;;
+    open) open_or_show "$id" || return 1 ;;
+    notifications) screen=notifications ;;
+    update-app)
+      if [ -s "$SHORTCUTS/.pending" ]; then
+        import_shortcut || return 1
+      elif [ ! -d "$JOBS/.app-updating" ]; then
+        update_in_background app
+        notice "Checking for a new version" "Tap ⬆️ again to see how it's going"
+      fi ;;
+    update-tools)
+      if [ ! -d "$JOBS/.updating" ]; then
+        update_in_background tools
+        notice "Updating the tools" "Tap 🔧 again to see how it's going"
+      fi ;;
+    auto) flip .no-auto-update ;;
+    pictures) flip .plain ;;
+    ish) echo @@app; return 1 ;;
+    bark-store) open_link "$BARK_APP"; return 1 ;;
+    bark-paste) : >"$JOBS/.bark-next"; echo @@clipboard; return 1 ;;  # see add_links
+    bark-on) mv "$JOBS/.bark.off" "$JOBS/.bark" 2>/dev/null ;;
+    bark-test)
+      if out=$(bark "🔔 Test from aria2" "Tapping this opens your Downloads folder." "$(files_url "$SHARE")" 2>&1); then
+        notice "Sent a test notification" "If none arrives, allow Bark's notifications in Settings → Apps → Bark"
+      else
+        notice "Bark didn't take it" "${out#curl: (*) }"
+      fi ;;
+    bark-off) mv "$JOBS/.bark" "$JOBS/.bark.off" 2>/dev/null; notice "Notifications are off" ;;
+  esac
+  return 0
+}
+
+flip() {  # flip <setting>: a file in $JOBS that's there when it's on
+  if [ -e "$JOBS/$1" ]; then rm -f "$JOBS/$1"; else : >"$JOBS/$1"; fi
+}
+
+open_link() {  # open_link <link>: the answer that opens it
+  if [ -n "$SHORTCUT" ]; then echo "@@open:$1"; else echo "$1"; fi
+}
+
+# When the Shortcut opens: see whether it's the new shortcut, offer a new one (once), and
+# start any update that's due. Fails after printing an answer for the Shortcut.
+opening() {
+  version=$(cat "$SHORTCUTS/.version" 2>/dev/null)
+  [ -n "$SHORTCUT" ] && [ "$SHORTCUT" = "$version" ] && rm -f "$SHORTCUTS/.pending"
+  if auto_updates; then
+    due "$JOBS/.app-checked" 21600 && [ ! -d "$JOBS/.app-updating" ] && update_in_background app
+    due "$JOBS/.updated" 86400 && [ ! -d "$JOBS/.updating" ] && update_in_background tools
+  fi
+  if [ -s "$SHORTCUTS/.pending" ] && [ "$(cat "$SHORTCUTS/.offered" 2>/dev/null)" != "$version" ]; then
+    echo "$version" >"$SHORTCUTS/.offered"
+    import_shortcut || return 1
+  fi
+  return 0
+}
+
+# The answer that gets the new shortcut imported (and fails), or else a notice saying
+# where it is. Setup writes where it put the file into .pending.
+import_shortcut() {
+  if [ -n "$SHORTCUT" ] && [ -s "$SHORTCUTS/aria2.shortcut" ]; then
+    echo @@import
+    return 1
+  fi
+  where=$(cat "$SHORTCUTS/.pending" 2>/dev/null)
+  if url=$(files_url "$where"); then
+    echo "$url"
+    return 1
+  fi
+  notice "Open the new shortcut in Files" "$where"
+  return 0
+}
 
 main_screen() {
-  # An update that brought a new shortcut says where it is, until this line is tapped.
-  [ -s "$SHORTCUTS/.pending" ] &&
-    echo "🆕 New shortcut: $(cat "$SHORTCUTS/.pending"). Open it, tap Replace, then tap here."
-  echo "📥 Downloads$(summary)"
-  echo "➕ Add link from clipboard"
-  echo "📂 Open the Downloads folder"
-  if [ -d "$JOBS/.updating" ]; then echo "🔧 $(update_progress)"; else echo "🔧 Update tools"; fi
-  if [ -s "$JOBS/.bark" ]; then echo "🔔 Notifications · on"; else echo "🔔 Turn on notifications"; fi
-  echo "📲 Open iSH-AOK"
-  echo "❌ Close"
-}
-
-summary() {  # e.g. " · 1 downloading, 3 finished"
-  running=0 paused=0 finished=0
+  [ -s "$SHORTCUTS/.pending" ] && row import 🆕 "New aria2 shortcut" "Tap to install it, then tap Replace"
+  running=0 paused=0 finished=0 sum=0 known=0
   for id in $(ids); do
     load "$id"
     case $state in
-      running) running=$((running + 1)) ;;
+      running)
+        running=$((running + 1))
+        [ -n "$pct" ] && sum=$((sum + ${overall:-$pct})) known=$((known + 1)) ;;
       paused) paused=$((paused + 1)) ;;
       *) finished=$((finished + 1)) ;;
     esac
   done
   s=
-  [ $running = 0 ] || s="$s, $running downloading"
-  [ $paused = 0 ] || s="$s, $paused paused"
-  [ $finished = 0 ] || s="$s, $finished finished"
-  printf '%s' "${s:+ · ${s#, }}"
+  [ $running = 0 ] || s="$s · $running downloading"
+  [ $paused = 0 ] || s="$s · $paused paused"
+  [ $finished = 0 ] || s="$s · $finished finished"
+  s=${s#" · "}
+  pic=downloads
+  [ $known = 0 ] || pic=ring$(((sum / known + 5) / 10 * 10))
+  row downloads 📥 Downloads "${s:-Nothing yet: share a link to aria2}" "$pic"
+  row add ➕ "Add link from clipboard" "Copy a link, then tap here"
+  row folder 📂 "Downloads folder" "Open it in Files"
+  s="Notifications $(on_off "$JOBS/.bark")"
+  if [ -d "$JOBS/.updating" ] || [ -d "$JOBS/.app-updating" ]; then
+    s="$s · updating…"
+  elif auto_updates; then
+    s="$s · automatic updates"
+  fi
+  row settings ⚙️ Settings "$s"
+}
+
+on_off() { if [ -s "$1" ]; then echo on; else echo off; fi; }  # on_off <file>
+
+# Sets emoji, title, detail and pic: how download <id> shows in the list, after load.
+describe() {
+  title=${playlist:-$name}
+  case $state in
+    running)
+      if [ -n "$playlist" ]; then
+        emoji=⬇️ pic=ring$(((overall + 5) / 10 * 10))
+        if [ -n "$pct" ]; then
+          detail="Video $n of $total · $pct% · ${speed:-0B}/s"
+        else
+          detail="Video $n of $total · preparing · $label"
+        fi
+      elif [ -n "$pct" ]; then
+        emoji=⬇️ pic=ring$(((pct + 5) / 10 * 10)) detail="$pct% · ${speed:-0B}/s${eta:+ · $eta left}"
+      elif [ "$label" = 'moving to Files' ]; then
+        emoji=📦 pic=folder detail='Moving to Files…'
+      else
+        emoji=⏳ pic=prep$(((prep + 5) / 10 * 10)) detail="Preparing $prep% · $label…"
+      fi ;;
+    paused)
+      emoji=⏸ pic=paused detail="Paused${pct:+ at $pct%}"
+      [ -n "$playlist" ] && detail="Paused · video $n of $total" ;;
+    done)
+      emoji=✅ pic=done detail=Downloaded
+      # A video's file name is its title; the list doesn't need the .mp4.
+      [ "$via" = yt-dlp ] && [ -n "$path" ] && title=${title%.*}
+      if [ -n "$playlist" ]; then
+        title=$playlist pic=playlist detail="$videos videos"
+        [ "$errors" -gt 0 ] && detail="$detail · $errors failed"
+        [ -n "$stopped" ] && detail="Stopped · $videos of $total videos"
+      fi
+      detail="$detail${size:+ · $size}"
+      [ -s "$JOBS/$1.thumb" ] && pic=$JOBS/$1.thumb ;;
+    failed) emoji=⚠️ pic=failed detail="Failed${reason:+: $reason}" ;;
+  esac
 }
 
 list_screen() {
   prune
-  echo "⬅️ Back"
-  status
-  echo "⏸ Pause all"
-  echo "▶️ Resume all"
-  echo "🧹 Clear finished"
-  echo "🔄 Refresh"
+  row back:main ⬅️ Back
+  set -- $(ids | head -n $SHOWN)
+  [ $# -gt 0 ] || row notice ℹ️ "No downloads yet" "Share a link to aria2 to start one"
+  running= paused= finished=
+  for id; do
+    load "$id"
+    describe "$id"
+    row "dl:$id" "$emoji" "$title" "$detail" "$pic"
+    case $state in running) running=1 ;; paused) paused=1 ;; *) finished=1 ;; esac
+  done
+  [ -n "$running" ] && row pauseall ⏸ "Pause all"
+  [ -n "$paused" ] && row resumeall ▶️ "Resume all"
+  [ -n "$finished" ] && row clear 🧹 "Clear finished" "The files stay in Downloads"
+  row self 🔄 Refresh
 }
 
 item_screen() {  # item_screen <id>
@@ -678,81 +956,104 @@ item_screen() {  # item_screen <id>
     list_screen
     return
   fi
-  echo "⬅️ Back"
+  row back:list ⬅️ Back
   load "$1"
-  line "$1"
+  describe "$1"
+  [ -s "$JOBS/$1.thumb" ] && pic=$JOBS/$1.thumb
+  row self "$emoji" "$title" "$detail" "$pic"
   case $state in
-    running) echo "⏸ Pause"; echo "⏹ Stop and delete" ;;
-    paused) echo "▶️ Resume"; echo "⏹ Stop and delete" ;;
-    failed) echo "🔁 Try again"; echo "🗑 Remove from the list" ;;
-    done) echo "▶️ Open"; echo "🗑 Remove from the list (the file stays)" ;;
+    running) row pause ⏸ Pause "Resume it any time"; stop_row ;;
+    paused) row resume ▶️ Resume; stop_row ;;
+    failed) row resume 🔁 "Try again"; row remove 🗑 "Remove from the list" ;;
+    done) row open ▶️ Open "In the Files app"; row remove 🗑 "Remove from the list" "The file stays in Downloads" ;;
   esac
+}
+
+# A playlist that has finished some videos keeps them when it's stopped.
+stop_row() {
+  if [ -n "$playlist" ] && [ "$videos" -gt 0 ]; then
+    row stop ⏹ "Stop here" "Keeps the $videos finished video(s)"
+  else
+    row stop ⏹ "Stop and delete" "Deletes what it downloaded so far"
+  fi
+}
+
+settings_screen() {
+  row back:main ⬅️ Back
+  if [ -s "$JOBS/.bark" ]; then
+    row notifications 🔔 Notifications "On: one when a download finishes"
+  else
+    row notifications 🔕 Notifications "Off · tap to set up"
+  fi
+  row update-app ⬆️ "aria2 and its shortcut" "$(app_status)"
+  row update-tools 🔧 "Tools: yt-dlp, aria2, ffmpeg" "$(tools_status)"
+  if auto_updates; then
+    row auto 🔁 "Automatic updates" "On: tools daily, aria2 when you open it" auto
+  else
+    row auto 🔁 "Automatic updates" "Off" auto
+  fi
+  if [ -n "$SHORTCUT" ]; then
+    row pictures 🖼 "Pictures in menus" "$(on_off_flag "$JOBS/.plain")"
+  fi
+  row ish 📲 "Open iSH-AOK" "The terminal behind aria2"
+}
+
+on_off_flag() { if [ -e "$1" ]; then echo Off; else echo On; fi; }  # On unless <file> is there
+
+app_status() {
+  if [ -d "$JOBS/.app-updating" ]; then
+    step=$(sed -n 's/^=== app //p' "$JOBS/.app-update.log" 2>/dev/null | tail -n 1)
+    echo "${step:-Checking for a new version}…"
+  elif [ -s "$SHORTCUTS/.pending" ]; then
+    echo "New shortcut ready · tap to install"
+  elif [ -s "$JOBS/.app-checked" ]; then
+    echo "Up to date · checked $(ago "$JOBS/.app-checked")"
+  else
+    echo "Tap to check for a new version"
+  fi
+}
+
+tools_status() {
+  if [ -d "$JOBS/.updating" ]; then
+    update_progress
+  elif [ -s "$JOBS/.updated" ]; then
+    v=$(cat "$JOBS/.yt-dlp-version" 2>/dev/null)
+    echo "Updated $(ago "$JOBS/.updated")${v:+ · yt-dlp $v}"
+  else
+    echo "Tap to update them"
+  fi
+}
+
+ago() {  # ago <file with a time in it>: e.g. "3 h ago"
+  s=$(($(date +%s) - $(cat "$1")))
+  if [ $s -lt 120 ]; then echo "just now"
+  elif [ $s -lt 7200 ]; then echo "$((s / 60)) min ago"
+  elif [ $s -lt 172800 ]; then echo "$((s / 3600)) h ago"
+  else echo "$((s / 86400)) days ago"
+  fi
 }
 
 notifications_screen() {
-  echo "⬅️ Back"
+  row back:settings ⬅️ Back
   if [ -s "$JOBS/.bark" ]; then
-    echo "✅ On: one when a download finishes. Tap it to open the download."
-    echo "🔔 Send a test notification"
-    echo "🔕 Turn off notifications"
+    row notice ✅ "Notifications are on" "One when a download finishes. Tap it to open the download."
+    row bark-test 🔔 "Send a test notification"
+    row bark-off 🔕 "Turn off notifications"
     return
   fi
-  [ -s "$JOBS/.bark.off" ] && echo "🔔 Turn notifications back on"
-  echo "ℹ️ Notifications come through Bark, a free app, because iSH-AOK can't send any itself"
-  echo "1️⃣ Install Bark from the App Store, open it and allow its notifications"
-  echo "2️⃣ In Bark, tap the copy button next to one of its links"
-  echo "3️⃣ Then tap here"
+  [ -s "$JOBS/.bark.off" ] && row bark-on 🔔 "Turn notifications back on"
+  row notice ℹ️ "Notifications come through Bark" "A free app: iSH-AOK can't send any itself"
+  if [ -n "$SHORTCUT" ]; then
+    row bark-store 1️⃣ "Get Bark" "Opens the App Store. Open Bark, allow its notifications"
+  else
+    row notice 1️⃣ "Get Bark from the App Store" "Open it and allow its notifications"
+  fi
+  row notice 2️⃣ "In Bark, copy a link" "Tap the copy button next to one of its links"
+  row bark-paste 3️⃣ "Then tap here" "aria2 reads the link from the clipboard"
 }
 
-tapped() {  # tapped <line>: act on it. Fails after printing an answer the Shortcut acts on.
-  case $screen in
-    list)
-      case $1 in
-        '⬅️ '*) screen=main ;;
-        *' #'[0-9]*) open_or_show "${1##*#}" || return 1 ;;
-        *'Pause all') notice "$(pause_all)" ;;
-        *'Resume all') notice "$(resume_all)" ;;
-        *'Clear finished') notice "$(clear_finished)" ;;
-      esac ;;
-    item\ *)
-      id=${screen#item }
-      case $1 in
-        '⬅️ '*) screen=list ;;
-        '⏸ Pause') pause "$id"; rest_unless_busy ;;
-        '▶️ Resume' | '🔁 Try again') load "$id"; start "$link" "$id" ;;
-        '⏹ '*) notice "$(stop "$id")"; screen=list ;;
-        '🗑 '*) load "$id"; forget "$id"; notice "Removed $name from the list."; screen=list ;;
-        '▶️ Open') open_or_show "$id" || return 1 ;;
-      esac ;;
-    notifications)
-      case $1 in
-        '⬅️ '*) screen=main ;;
-        '3️⃣ '*) : >"$JOBS/.bark-next"; echo @@clipboard; return 1 ;;  # see add_links
-        '🔔 Turn'*) mv "$JOBS/.bark.off" "$JOBS/.bark" 2>/dev/null ;;
-        '🔔 Send'*)
-          if out=$(bark "🔔 Test from aria2" "Tapping this opens your Downloads folder." "$(files_url "$SHARE")" 2>&1); then
-            notice "Sent. If it doesn't arrive, check that Bark may send notifications (Settings → Apps → Bark)."
-          else
-            notice "Bark didn't take it. ${out#curl: (*) }"
-          fi ;;
-        '🔕 '*) mv "$JOBS/.bark" "$JOBS/.bark.off" 2>/dev/null; notice "Notifications are off." ;;
-      esac ;;
-    *)
-      case $1 in
-        '🆕 '*) rm -f "$SHORTCUTS/.pending" ;;
-        '📥 '*) screen=list ;;
-        '➕ '*) echo @@clipboard; return 1 ;;
-        '📂 '*) files_url "$SHARE" || echo "shareddocuments://"; return 1 ;;
-        '🔧 '*) [ -d "$JOBS/.updating" ] || update_in_background >/dev/null ;;
-        '🔔 '*) screen=notifications ;;
-        '📲 '*) echo @@app; return 1 ;;
-        '❌ '*) echo @@exit; return 1 ;;
-      esac ;;
-  esac
-  return 0
-}
-
-# A finished download opens in the Files app; any other shows its own screen.
+# A finished download opens in the Files app; any other shows its own screen. Fails after
+# printing an answer for the Shortcut.
 open_or_show() {  # open_or_show <id>
   load "$1"
   if [ "$state" != done ]; then
@@ -761,10 +1062,10 @@ open_or_show() {  # open_or_show <id>
   fi
   case $path in
     "$SHARE"/*)
-      files_url "$path" || echo "shareddocuments://"
+      open_link "$(files_url "$path" || echo "shareddocuments://")"
       return 1 ;;
   esac
-  notice "$name is in iSH-AOK's own Downloads folder. To get downloads in a Files folder, mount one in iSH-AOK: mount -t ios phone /mnt/phone"
+  notice "It's in iSH-AOK's own Downloads folder" "To get downloads in a Files folder, mount one in iSH-AOK: mount -t ios phone /mnt/phone"
   return 0
 }
 
@@ -812,16 +1113,17 @@ prune() {
   done
 }
 
-forget() { rm -f "$JOBS/$1.log" "$JOBS/$1.pid"; }  # forget <id>: drop it from the list
+forget() { rm -f "$JOBS/$1.log" "$JOBS/$1.pid" "$JOBS/$1.thumb"; }  # forget <id>: drop it from the list
 
-# Stop a download for good: delete what it left unfinished and drop it from the list.
-# Videos of a playlist that did finish are kept, and moved to Files like any download.
+# Stop a download for good: delete what it left unfinished. A playlist that finished some
+# videos keeps them, moved to Files like any download, and stays on the list as stopped;
+# anything else leaves the list. Prints what it did: a title line and a detail line.
 stop() {  # stop <id>
   load "$1"
-  title=$name
+  title=${playlist:-$name}
   [ "$state" = running ] && pause "$1"
   rest_unless_busy
-  if [ "$(segment "$1" | sed -n 's/^=== via //p' | tail -n 1)" = yt-dlp ]; then
+  if [ "$via" = yt-dlp ]; then
     # yt-dlp names each file it starts ("[download] Destination: …"), and says FILE: for
     # each one it finished.
     finished=$(segment "$1" | sed -n 's/^FILE: //p')
@@ -837,13 +1139,20 @@ stop() {  # stop <id>
       top=${top%%/*}
       # A torrent downloads into a folder of its own, with its .aria2 file next to it.
       if [ -n "$top" ] && [ "$top" != "${p#"$DEST"/}" ] && [ -d "$DEST/$top" ]; then
-        rm -rf "${DEST:?}/$top"
-        rm -f "$DEST/$top.aria2"
+        rm -rf "${DEST:?}/${top:?}"
+        rm -f "${DEST:?}/${top:?}.aria2"
       fi
     done
   fi
-  forget "$1"
-  echo "Stopped $title and deleted what it had downloaded."
+  load "$1"
+  echo "Stopped $title"
+  if [ -n "$playlist" ] && [ "$videos" -gt 0 ]; then
+    echo "=== stopped" >>"$JOBS/$1.log"
+    echo "Kept the $videos video(s) it had finished"
+  else
+    forget "$1"
+    echo "Deleted what it had downloaded"
+  fi
 }
 
 unfinished() {  # unfinished <path>: delete a partial download, only ever inside $DEST
@@ -852,10 +1161,15 @@ unfinished() {  # unfinished <path>: delete a partial download, only ever inside
 }
 
 case $1 in
-  -ui) ui "$(decode "$3")" ;;
+  -ui) [ "$4" = -k ] && SHORTCUT=$5; ui "$(decode "$3")" ;;
+  --shortcut) base64 "$SHORTCUTS/aria2.shortcut" | tr -d '\n' ;;  # for @@import
   --work) work "$2" ;;
-  --update) keep_awake; update_now; rest_unless_busy ;;
-  -u) update_in_background ;;
+  --thumb) thumb "$2" "$3" ;;
+  --update)
+    keep_awake
+    case $2 in tools | app) update_now "$2" ;; *) update_now tools; update_now app ;; esac
+    rest_unless_busy ;;
+  -u) update_in_background both; echo "Updating aria2 and its tools in the background." ;;
   -v) versions ;;
   -s) status ;;
   -m) status; actions ;;
