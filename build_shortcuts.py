@@ -37,7 +37,7 @@ SHORTCUT_INPUT = {"Type": "ExtensionInput"}
 # Icon colour and glyph, as numbered by the Shortcuts app.
 TEAL, DOWNLOAD_GLYPH = 431817727, 59693
 # If conditions, as numbered by the Shortcuts app.
-CONTAINS, HAS_ANY_VALUE = 99, 100
+BEGINS_WITH, HAS_ANY_VALUE = 8, 100
 # Control flow: the opening action of a block, its "Otherwise", and its "End".
 START, MIDDLE, END = 0, 1, 2
 
@@ -121,6 +121,14 @@ def open_ish_aok():
     return action("openapp", WFAppIdentifier=ISH_AOK["BundleIdentifier"], WFSelectedApp=ISH_AOK)
 
 
+def set_variable(name, value):
+    return action("setvariable", WFVariableName=name, WFInput=attachment(value))
+
+
+def variable(name):
+    return {"Type": "Variable", "VariableName": name}
+
+
 def aria2():
     acts = []
 
@@ -131,26 +139,36 @@ def aria2():
     acts += [if_(shared, SHORTCUT_INPUT, HAS_ANY_VALUE), *start, notify(run),
              action("exit"), control("conditional", shared, END)]
 
-    # Opened on its own: the download list, shown again after every choice until Close.
+    # Opened on its own: dl's screens (see `dl -ui`), one after another until Close. Each
+    # time round, dl gets the line tapped last ("@@start" the first time) and prints the
+    # next screen, or an answer only the Shortcut can carry out.
+    start_text = action("gettext", WFTextActionText=text("@@start"))
+    acts += [start_text, set_variable("tapped", output_of(start_text, "Text"))]
     loop = new_uuid()
-    menu = run_command("dl -m")
-    lines = action("text.split", text=text(output_of(menu, "Run Command")), WFTextSeparator="New Lines")
-    choose = action("choosefromlist", WFInput=attachment(output_of(lines, "Split Text")),
-                    WFChooseFromListActionPrompt="Tap a download to pause or resume it.")
-    chosen = output_of(choose, "Chosen Item")
-    acts += [control("repeat.count", loop, START, WFRepeatCount=200), menu, lines, choose]
+    ui, run = run_with_base64("dl -ui -b", variable("tapped"))
+    answer = output_of(run, "Run Command")
+    acts += [control("repeat.count", loop, START, WFRepeatCount=500), *ui]
 
-    # dl -m lists these three, but only the Shortcut can do them.
-    close, open_app, add = new_uuid(), new_uuid(), new_uuid()
-    acts += [if_(close, chosen, CONTAINS, "❌"), action("exit"), control("conditional", close, END)]
-    acts += [if_(open_app, chosen, CONTAINS, "📲"), open_ish_aok(), action("exit"),
+    opens, close, open_app, clipboard_add = new_uuid(), new_uuid(), new_uuid(), new_uuid()
+    acts += [if_(opens, answer, BEGINS_WITH, "shareddocuments:"),
+             action("openurl", WFInput=text(answer)), action("exit"),
+             control("conditional", opens, END)]
+    acts += [if_(close, answer, BEGINS_WITH, "@@exit"), action("exit"),
+             control("conditional", close, END)]
+    acts += [if_(open_app, answer, BEGINS_WITH, "@@app"), open_ish_aok(), action("exit"),
              control("conditional", open_app, END)]
     clipboard = action("getclipboard")
-    from_clipboard, run = run_with_base64("dl -b", output_of(clipboard, "Clipboard"))
-    # Anything else (a download, Pause all, Resume all, Clear finished, Refresh) is dl's to do.
-    other, _ = run_with_base64("dl -a -b", chosen)
-    acts += [if_(add, chosen, CONTAINS, "➕"), clipboard, *from_clipboard, notify(run),
-             control("conditional", add, MIDDLE), *other, control("conditional", add, END)]
+    from_clipboard, added = run_with_base64("dl -b", output_of(clipboard, "Clipboard"))
+    nothing = action("gettext", WFTextActionText=text(""))  # then dl shows the same screen again
+    lines = action("text.split", text=text(answer), WFTextSeparator="New Lines")
+    choose = action("choosefromlist", WFInput=attachment(output_of(lines, "Split Text")),
+                    WFChooseFromListActionPrompt="aria2")
+    acts += [if_(clipboard_add, answer, BEGINS_WITH, "@@clipboard"),
+             clipboard, *from_clipboard, notify(added),
+             nothing, set_variable("tapped", output_of(nothing, "Text")),
+             control("conditional", clipboard_add, MIDDLE),
+             lines, choose, set_variable("tapped", output_of(choose, "Chosen Item")),
+             control("conditional", clipboard_add, END)]
 
     acts.append(control("repeat.count", loop, END))
     return {

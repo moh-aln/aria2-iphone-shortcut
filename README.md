@@ -45,31 +45,45 @@ Both run in Alpine Linux inside the [iSH-AOK](https://github.com/emkey1/ish-AOK)
 ## Using the "aria2" shortcut
 
 - **Share a link** to it (from Safari, YouTube, Instagram, X or any app's Share button). It starts downloading in the background and shows a notification.
-- **Run it on its own** (Home Screen, Shortcuts app or Siri) for the download list:
+- **Run it on its own** (Home Screen, Shortcuts app or Siri) for its menu:
 
 ```
-⬇️ ▰▰▰▱▱▱▱▱▱▱ 32% · big-file.zip · 1.2MiB/s · 30s left  #4
-⬇️ ▰▰▱▱▱▱▱▱▱▱ video 3 of 12 · 45% · 1.2MiB/s · 📃 My Playlist  #3
-⏸ ▰▰▰▱▱▱▱▱▱▱ 32% · other-file.tar.xz · paused  #2
-✅ rabbit320.mp4 · 816K  #1
+📥 Downloads · 1 downloading, 3 finished
 ➕ Add link from clipboard
-⏸ Pause all
-▶️ Resume all
-🧹 Clear finished
+📂 Open the Downloads folder
 🔧 Update tools
-🔄 Refresh
 📲 Open iSH-AOK
 ❌ Close
 ```
 
-- Tap a download to pause it, or to resume or retry it. Sharing a link that's already in the list resumes it instead of starting over.
-- **Clear finished** removes finished and failed downloads from the list; the files stay.
+**📥 Downloads** shows the list:
+
+```
+⬅️ Back
+⏳ ▰▰▰▰▰▱▱▱▱▱ 50% preparing · unlocking the video link, about a minute… · youtube.com video  #5
+⬇️ ▰▰▰▱▱▱▱▱▱▱ 32% · big-file.zip · 1.2MiB/s · 30s left  #4
+⬇️ ▰▰▱▱▱▱▱▱▱▱ video 3 of 12 · 45% · 1.2MiB/s · 📃 My Playlist  #3
+⏸ ▰▰▰▱▱▱▱▱▱▱ 32% · other-file.tar.xz · paused  #2
+✅ rabbit320.mp4 · 816K  #1
+⏸ Pause all
+▶️ Resume all
+🧹 Clear finished
+🔄 Refresh
+```
+
+- **Tap a finished download** to open it in the Files app, which plays videos and music. A playlist opens its folder.
+- **Tap any other download** for its own screen: **⏸ Pause** or **▶️ Resume**, and **⏹ Stop and delete**, which stops it, deletes what it downloaded so far and removes it from the list. Failed downloads offer **🔁 Try again**.
+- **⏳ preparing** is everything before the download itself. For YouTube that's mostly unlocking the video link, which takes about a minute.
+- The list keeps only the 6 most recent finished downloads, and **🧹 Clear finished** removes them all. The files always stay.
 - **Playlists:** a playlist link (not a video that happens to be in one) downloads the whole playlist into a folder named after it. The bar is for the whole playlist. When it finishes, the line reads `✅ 📃 My Playlist · 12 videos`, plus how many failed, if any.
 - **Videos** are saved as MP4 (H.264 when the site offers it, which plays everywhere on the iPhone), named after their title.
+- **Close the menu with ❌** (or swipe it away) when you're done: while it's open, the shortcut keeps running.
+
+All of these screens come from `dl` itself; the shortcut only shows them. So new menus arrive with `dl`'s updates, without importing a new shortcut.
 
 ## Updates
 
-Once a day, after a download, `dl` updates itself and its tools in the background. **🔧 Update tools** in the list does it right away. An update:
+Once a day, after a download, `dl` updates itself and its tools in the background. **🔧 Update tools** in the menu does it right away, and shows which of its 3 steps it's on. An update:
 - runs `yt-dlp -U`, since YouTube changes often
 - updates aria2, ffmpeg, Node, QuickJS and curl from Alpine
 - runs this repository's `shortcuts/setup-on-phone.sh` whenever it differs from the one that last ran. That's how a new `dl` arrives.

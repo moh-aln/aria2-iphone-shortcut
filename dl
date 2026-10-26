@@ -167,10 +167,14 @@ segment() { # segment <id>: the log since the download's latest (re)start
 # "🔧 Update tools" in the menu does it at once.
 update_tools() {
   echo "=== update $(date)"
+  # "=== step N <what>" lines are what the menu shows while this runs.
+  echo "=== step 1 Alpine packages"
   timeout 600 apk update -q && timeout 1800 apk add -q -u aria2 curl ffmpeg nodejs quickjs
+  echo "=== step 2 yt-dlp"
   case $(command -v yt-dlp) in /usr/local/bin/*) timeout 600 yt-dlp -U ;; esac
   # The setup script installs dl and, when it changed, a new signed shortcut. Run the
   # repository's copy only when it differs from the one last run here.
+  echo "=== step 3 dl and the shortcut"
   if timeout 120 curl -fsSL -o "$JOBS/.setup.new" "$UPDATE_URL" &&
       [ "$(sha256sum <"$JOBS/.setup.new" | cut -d' ' -f1)" != "$(cat "$JOBS/.setup" 2>/dev/null)" ]; then
     echo "=== new setup"
@@ -192,6 +196,14 @@ update_now() {
 update_if_due() {
   last=$(cat "$JOBS/.updated" 2>/dev/null)
   [ $(($(date +%s) - ${last:-0})) -ge 86400 ] && update_now
+}
+
+update_progress() {  # e.g. "Updating · 2 of 3: yt-dlp ▰▰▰▱▱▱▱▱▱▱"
+  now=$(awk '/^=== update/ { s = "" } /^=== step / { s = $3 " " substr($0, index($0, $4)) } END { print s }' \
+    "$JOBS/.update.log" 2>/dev/null)
+  n=${now%% *}
+  case $n in 1 | 2 | 3) ;; *) n=1 now="1 starting" ;; esac
+  echo "Updating · $n of 3: ${now#* } $(bar $(((n - 1) * 33)))"
 }
 
 versions() {
@@ -222,6 +234,9 @@ deliver() {  # deliver <id>: move the finished download into $SHARE, if that's m
   # A playlist's or a torrent's file is in a folder: move that whole folder.
   top=${path#"$DEST"/}
   top=${top%%/*}
+  # The list shows this size afterwards, so it never has to look inside the Files folder:
+  # reading there goes through iOS's file coordination, which can hold up the Files app.
+  echo "=== size $(du -sh "$DEST/$top" 2>/dev/null | cut -f1)"
   echo "=== moving to Files"
   if [ -d "$DEST/$top" ]; then
     # Merge into a folder of the same name, file by file, leaving out the partial files
@@ -287,6 +302,13 @@ load() {
   step=$(printf '%s\n' "$seg" | grep -E '^\[[A-Za-z:_]+\] ' | grep -v -E '^\[(Exec|download)\]' |
     tail -n 1 | sed 's/^\(\[[^]]*\] \)*//; s/^[^ :]*: //' | cut -c1-48)
   case $seg in *'=== moving to Files'*) step='moving to Files' pct= ;; esac
+  [ "$state" = running ] && [ -z "$pct" ] && preparing
+  size=
+  if [ "$state" = done ]; then
+    size=$(printf '%s\n' "$seg" | sed -n 's/^=== size //p' | tail -n 1)
+    # Look at the file itself only when it's still in $DEST (see deliver).
+    case $path in "$SHARE"/* | '') ;; *) [ -n "$size" ] || size=$(du -sh "$path" 2>/dev/null | cut -f1) ;; esac
+  fi
   # A playlist: "[download] Downloading playlist: <title>", then "Downloading item 3 of 12"
   # before each video, and a FILE: line for each video that finished.
   playlist=$(printf '%s\n' "$seg" | sed -n 's/^\[download\] Downloading playlist: //p' | tail -n 1)
@@ -300,7 +322,30 @@ load() {
   errors=$(printf '%s\n' "$seg" | grep -c '^ERROR: ')
   # Some videos failing doesn't make the playlist a failure.
   [ "$state" = failed ] && [ "$videos" -gt 0 ] && state=done
-  [ -f "$path" ] && path=${path%/*}  # its folder, for the size
+  case $path in "$DEST"/*/*) path=${path%/*} ;; esac  # a video in its folder: the folder
+  if [ "$state" = done ] && [ -z "$size" ]; then
+    case $path in "$SHARE"/*) ;; *) size=$(du -sh "$path" 2>/dev/null | cut -f1) ;; esac
+  fi
+}
+
+# Before a download starts there's preparation: for YouTube a minute or more, mostly
+# "Solving JS challenges". Each step yt-dlp reports stands for a share of it.
+preparing() {
+  case $step in
+    *'Extracting URL'*) prep=8 label='opening the link' ;;
+    *'Downloading webpage'*) prep=15 label='reading the page' ;;
+    *'API JSON'*) prep=25 label='asking for the formats' ;;
+    *'Downloading player'*) prep=35 label="getting YouTube's player" ;;
+    *'Solving JS challenges'*) prep=50 label='unlocking the video link, about a minute' ;;
+    *'Extracting information'*) prep=50 label='looking for the video' ;;
+    *m3u8* | *MPD*) prep=80 label='getting the list of streams' ;;
+    *'format(s)'*) prep=95 label='about to start' ;;
+    'moving to Files') prep=100 label='moving to Files' ;;
+    '')
+      prep=3 label='starting'
+      case $link in magnet:*) prep=10 label='looking for peers' ;; esac ;;
+    *) prep=50 label=$step ;;
+  esac
 }
 
 bar() {
@@ -322,13 +367,13 @@ line() {
     running)
       if [ -n "$pct" ]; then
         echo "⬇️ $(bar "$pct") $pct% · $name · ${speed:-0B}/s${eta:+ · $eta left}  #$1"
+      elif [ "$label" = 'moving to Files' ]; then
+        echo "📦 moving to Files… · $name  #$1"
       else
-        echo "⬇️ ${step:-starting}… · $name  #$1"
+        echo "⏳ $(bar "$prep") $prep% preparing · $label… · $name  #$1"
       fi ;;
     paused) echo "⏸ ${pct:+$(bar "$pct") $pct% · }$name · paused  #$1" ;;
-    done)
-      size=$(du -sh "$path" 2>/dev/null | cut -f1)
-      echo "✅ $name${size:+ · $size}  #$1" ;;
+    done) echo "✅ $name${size:+ · $size}  #$1" ;;
     failed) echo "⚠️ $name · failed${reason:+: $reason}  #$1" ;;
   esac
 }
@@ -340,12 +385,11 @@ playlist_line() {
       if [ -n "$pct" ]; then
         now="$pct% · ${speed:-0B}/s"
       else
-        now="${step:-starting}…"
+        now="preparing · $label…"
       fi
       echo "⬇️ $(bar "$overall") video $n of $total · $now · $name  #$1" ;;
     paused) echo "⏸ $(bar "$overall") video $n of $total · $name · paused  #$1" ;;
     done)
-      size=$(du -sh "$path" 2>/dev/null | cut -f1)
       failed=
       [ "$errors" -gt 0 ] && failed=", $errors failed"
       echo "✅ $name · $videos videos$failed${size:+ · $size}  #$1" ;;
@@ -447,7 +491,8 @@ clear_finished() {
   echo "Cleared $n finished download(s). The files are still in Downloads."
 }
 
-# The Shortcut shows these under the downloads. It handles ➕, 📲 and ❌ itself.
+# dl -m and dl -a are the menu of the first single shortcut, kept for phones that haven't
+# imported the newer one (see dl -ui below). It handles ➕, 📲 and ❌ itself.
 actions() {
   # An update that brought a new shortcut says where it is, until this line is tapped.
   [ -s "$SHORTCUTS/.pending" ] &&
@@ -482,7 +527,233 @@ update_in_background() {
   echo "Updating yt-dlp and the other tools in the background."
 }
 
+# ---- The Shortcut's screens ----
+#
+# The Shortcut runs `dl -ui -b '<the line tapped, base64>'` again and again and shows what
+# it prints as a list to tap: "@@start" when it opens, and nothing after it handled a tap
+# itself. A few answers it acts on instead of showing them:
+#   shareddocuments://…   opens that file or folder in the Files app
+#   @@clipboard           adds the link on the clipboard
+#   @@app                 opens iSH-AOK
+#   @@exit                closes
+# So every screen lives here, and changing one never needs a new shortcut. The screen on
+# show is kept in $JOBS/.screen ("main", "list" or "item <id>"), and a message for the
+# next screen in $JOBS/.notice.
+
+KEEP_FINISHED=6  # finished downloads the list keeps; older ones drop off it (files stay)
+
+ui() {  # ui <tapped line>
+  screen=$(cat "$JOBS/.screen" 2>/dev/null)
+  case $1 in
+    @@start) screen=main ;;
+    '') ;;
+    *) tapped "$1" || return 0 ;;
+  esac
+  echo "$screen" >"$JOBS/.screen"
+  if [ -s "$JOBS/.notice" ]; then
+    echo "ℹ️ $(cat "$JOBS/.notice")"
+    : >"$JOBS/.notice"
+  fi
+  case $screen in
+    list) list_screen ;;
+    item\ *) item_screen "${screen#item }" ;;
+    *) main_screen ;;
+  esac
+}
+
+notice() { printf '%s\n' "$1" >"$JOBS/.notice"; }
+
+main_screen() {
+  # An update that brought a new shortcut says where it is, until this line is tapped.
+  [ -s "$SHORTCUTS/.pending" ] &&
+    echo "🆕 New shortcut: $(cat "$SHORTCUTS/.pending"). Open it, tap Replace, then tap here."
+  echo "📥 Downloads$(summary)"
+  echo "➕ Add link from clipboard"
+  echo "📂 Open the Downloads folder"
+  if [ -d "$JOBS/.updating" ]; then echo "🔧 $(update_progress)"; else echo "🔧 Update tools"; fi
+  echo "📲 Open iSH-AOK"
+  echo "❌ Close"
+}
+
+summary() {  # e.g. " · 1 downloading, 3 finished"
+  running=0 paused=0 finished=0
+  for id in $(ids); do
+    load "$id"
+    case $state in
+      running) running=$((running + 1)) ;;
+      paused) paused=$((paused + 1)) ;;
+      *) finished=$((finished + 1)) ;;
+    esac
+  done
+  s=
+  [ $running = 0 ] || s="$s, $running downloading"
+  [ $paused = 0 ] || s="$s, $paused paused"
+  [ $finished = 0 ] || s="$s, $finished finished"
+  printf '%s' "${s:+ · ${s#, }}"
+}
+
+list_screen() {
+  prune
+  echo "⬅️ Back"
+  status
+  echo "⏸ Pause all"
+  echo "▶️ Resume all"
+  echo "🧹 Clear finished"
+  echo "🔄 Refresh"
+}
+
+item_screen() {  # item_screen <id>
+  if [ ! -f "$JOBS/$1.log" ]; then
+    echo list >"$JOBS/.screen"
+    list_screen
+    return
+  fi
+  echo "⬅️ Back"
+  load "$1"
+  line "$1"
+  case $state in
+    running) echo "⏸ Pause"; echo "⏹ Stop and delete" ;;
+    paused) echo "▶️ Resume"; echo "⏹ Stop and delete" ;;
+    failed) echo "🔁 Try again"; echo "🗑 Remove from the list" ;;
+    done) echo "▶️ Open"; echo "🗑 Remove from the list (the file stays)" ;;
+  esac
+}
+
+tapped() {  # tapped <line>: act on it. Fails after printing an answer the Shortcut acts on.
+  case $screen in
+    list)
+      case $1 in
+        '⬅️ '*) screen=main ;;
+        *' #'[0-9]*) open_or_show "${1##*#}" || return 1 ;;
+        *'Pause all') notice "$(pause_all)" ;;
+        *'Resume all') notice "$(resume_all)" ;;
+        *'Clear finished') notice "$(clear_finished)" ;;
+      esac ;;
+    item\ *)
+      id=${screen#item }
+      case $1 in
+        '⬅️ '*) screen=list ;;
+        '⏸ Pause') pause "$id"; rest_unless_busy ;;
+        '▶️ Resume' | '🔁 Try again') load "$id"; start "$link" "$id" ;;
+        '⏹ '*) notice "$(stop "$id")"; screen=list ;;
+        '🗑 '*) load "$id"; forget "$id"; notice "Removed $name from the list."; screen=list ;;
+        '▶️ Open') open_or_show "$id" || return 1 ;;
+      esac ;;
+    *)
+      case $1 in
+        '🆕 '*) rm -f "$SHORTCUTS/.pending" ;;
+        '📥 '*) screen=list ;;
+        '➕ '*) echo @@clipboard; return 1 ;;
+        '📂 '*) files_url "$SHARE" || echo "shareddocuments://"; return 1 ;;
+        '🔧 '*) [ -d "$JOBS/.updating" ] || update_in_background >/dev/null ;;
+        '📲 '*) echo @@app; return 1 ;;
+        '❌ '*) echo @@exit; return 1 ;;
+      esac ;;
+  esac
+  return 0
+}
+
+# A finished download opens in the Files app; any other shows its own screen.
+open_or_show() {  # open_or_show <id>
+  load "$1"
+  if [ "$state" != done ]; then
+    screen="item $1"
+    return 0
+  fi
+  case $path in
+    "$SHARE"/*)
+      files_url "$path" || echo "shareddocuments://"
+      return 1 ;;
+  esac
+  notice "$name is in iSH-AOK's own Downloads folder. To get downloads in a Files folder, mount one in iSH-AOK: mount -t ios phone /mnt/phone"
+  return 0
+}
+
+# shareddocuments://<iOS path> opens a file or folder in the Files app. iSH-AOK lists the
+# iOS path of the folder mounted at $SHARE as that mount's source in /proc/mounts.
+files_url() {  # files_url <path at or under $SHARE>
+  case $1 in "$SHARE" | "$SHARE"/*) ;; *) return 1 ;; esac
+  host=$(share_host)
+  case $host in /*) ;; *) return 1 ;; esac
+  printf 'shareddocuments://%s\n' "$(urlencode "$host${1#"$SHARE"}")"
+}
+
+share_host() {
+  if [ -n "$DL_SHARE" ]; then  # tests: the folder stands for itself
+    printf %s "$SHARE"
+    return
+  fi
+  # Fields are separated by spaces, so a space in a path is written \040 (and \ as \134).
+  sed -n "s|^\([^ ]*\) $SHARE [^ ]* .*|\1|p" /proc/mounts 2>/dev/null | head -n 1 |
+    sed 's/\\040/ /g; s/\\134/\\/g'
+}
+
+urlencode() {  # percent-encode all but letters, digits, - . _ ~ and /
+  printf %s "$1" | od -An -tx1 -v | awk '
+    BEGIN {
+      for (i = 32; i < 127; i++) {
+        c = sprintf("%c", i)
+        if (c ~ /[A-Za-z0-9._~\/-]/) keep[sprintf("%02x", i)] = c
+      }
+    }
+    { for (i = 1; i <= NF; i++) out = out (($i in keep) ? keep[$i] : "%" toupper($i)) }
+    END { printf "%s", out }'
+}
+
+# Keep the list short: only the newest $KEEP_FINISHED finished downloads stay on it.
+prune() {
+  kept=0
+  for id in $(ids); do
+    load "$id"
+    case $state in
+      done | failed)
+        kept=$((kept + 1))
+        [ $kept -gt $KEEP_FINISHED ] && forget "$id" ;;
+    esac
+  done
+}
+
+forget() { rm -f "$JOBS/$1.log" "$JOBS/$1.pid"; }  # forget <id>: drop it from the list
+
+# Stop a download for good: delete what it left unfinished and drop it from the list.
+# Videos of a playlist that did finish are kept, and moved to Files like any download.
+stop() {  # stop <id>
+  load "$1"
+  title=$name
+  [ "$state" = running ] && pause "$1"
+  rest_unless_busy
+  if [ "$(segment "$1" | sed -n 's/^=== via //p' | tail -n 1)" = yt-dlp ]; then
+    # yt-dlp names each file it starts ("[download] Destination: …"), and says FILE: for
+    # each one it finished.
+    finished=$(segment "$1" | sed -n 's/^FILE: //p')
+    segment "$1" | sed -n 's/^\[download\] Destination: //p' | while IFS= read -r p; do
+      printf '%s\n' "$finished" | grep -qxF -- "$p" || unfinished "$p"
+    done
+    deliver "$1" >>"$JOBS/$1.log"
+  else
+    # aria2 names its file (a torrent's first file) in FILE: lines while it downloads.
+    segment "$1" | sed -n 's/^FILE: //p' | sort -u | while IFS= read -r p; do
+      unfinished "$p"
+      top=${p#"$DEST"/}
+      top=${top%%/*}
+      # A torrent downloads into a folder of its own, with its .aria2 file next to it.
+      if [ -n "$top" ] && [ "$top" != "${p#"$DEST"/}" ] && [ -d "$DEST/$top" ]; then
+        rm -rf "${DEST:?}/$top"
+        rm -f "$DEST/$top.aria2"
+      fi
+    done
+  fi
+  forget "$1"
+  echo "Stopped $title and deleted what it had downloaded."
+}
+
+unfinished() {  # unfinished <path>: delete a partial download, only ever inside $DEST
+  case $1 in "$DEST"/?*) ;; *) return 0 ;; esac
+  rm -f "$1" "$1.part" "$1.ytdl" "$1.aria2" "$1".part-Frag*
+}
+
 case $1 in
+  -ui) ui "$(decode "$3")" ;;
   --work) work "$2" ;;
   --update) keep_awake; update_now; rest_unless_busy ;;
   -u) update_in_background ;;

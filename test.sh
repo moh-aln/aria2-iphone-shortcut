@@ -22,6 +22,7 @@ printf '<!doctype html><title>Just text</title><p>No video here.</p>\n' >"$tmp/w
 cp "$tmp/www/rabbit.mp4" "$tmp/www/rabbit2.mp4"
 printf '<!doctype html><title>Rabbit playlist</title><video src="rabbit.mp4"></video><video src="rabbit2.mp4"></video>\n' \
   >"$tmp/www/playlist.html"
+printf '<!doctype html><title>Slow page</title><video src="rabbit2.mp4"></video>\n' >"$tmp/www/slow.html"
 port=18780
 export DL_UPDATE_URL=http://127.0.0.1:$port/setup.sh
 printf '#!/bin/sh\necho ran >>"%s/setup-runs"\nsha256sum <"$0" | cut -d" " -f1 >"$DL_DIR/.logs/.setup"\n' "$tmp" \
@@ -33,7 +34,7 @@ trap 'kill $server; pkill -f "$tmp"; pkill -f "$here/dl --work"; rm -rf "$tmp"' 
 # Alpine's BusyBox has nohup, pgrep and pkill; Ubuntu's doesn't, so those come from the system.
 # aria2c and yt-dlp are slowed down so a download is still running when the checks look at it.
 mkdir "$tmp/bin"
-for tool in busybox sh awk base64 cat cut date dd du find grep head ls mkdir mv rm rmdir sed seq setsid sha256sum sleep sort tail timeout tr wc; do
+for tool in busybox sh awk base64 cat cut date dd du find grep head ls mkdir mv od rm rmdir sed seq setsid sha256sum sleep sort tail timeout tr wc; do
   ln -s "$(command -v busybox)" "$tmp/bin/$tool"
 done
 for tool in nohup pgrep pkill kill curl; do ln -s "$(command -v $tool)" "$tmp/bin/$tool"; done
@@ -62,6 +63,7 @@ VIDEO_PAGE=http://127.0.0.1:$port/video.html                                    
 TEXT_PAGE=http://127.0.0.1:$port/text.html                                                      #7
 YOUTUBE=https://www.youtube.com/watch?v=aqz-KE-bpKQ                                             #8
 PLAYLIST_PAGE=http://127.0.0.1:$port/playlist.html                                              #9
+SLOW_PAGE=http://127.0.0.1:$port/slow.html                                                      #10
 
 out=$(dl -s)
 check "empty list" "$out" "No downloads yet."
@@ -92,7 +94,7 @@ check "status: finished download, with its size" "$out" "✅ NEWS · "
   { echo "FAIL  NEWS wasn't moved to the shared folder"; ls "$DL_DIR" "$DL_SHARE"; fails=$((fails + 1)); }
 check "status: failed download and why" "$out" "⚠️ NOPE_404 · failed: Resource not found"
 check "status: aria2 progress bar, speed and time left" "$(line_for aria2-1.37.0)" "left  #2"
-check "status: magnet shows its name" "$out" "⬇️ starting… · Nobody Shares This  #5"
+check "status: a magnet is preparing until it finds peers" "$out" "⏳ ▰▱▱▱▱▱▱▱▱▱ 10% preparing · looking for peers… · Nobody Shares This  #5"
 check "status: video progress bar under the page's title" "$(line_for '#6')" "% · Rabbit test page"
 check "status: a page without a video" "$out" "⚠️ text.html · failed: no video found on this page  #7"
 check "status: yt-dlp's own error shows (YouTube is unreachable from a test machine)" "$(line_for '#8')" "· failed: "
@@ -180,6 +182,49 @@ check "a finished playlist says how many videos" "$(line_for '#9')" "✅ 📃 Ra
 [ "$(ls "$DL_SHARE/Rabbit playlist" 2>/dev/null | grep -c '\.mp4$')" = 2 ] && [ ! -e "$DL_DIR/Rabbit playlist" ] &&
   echo "ok    the playlist's folder moves to the shared folder" ||
   { echo "FAIL  playlist folder not moved"; find "$DL_DIR" "$DL_SHARE"; fails=$((fails + 1)); }
+
+# The Shortcut's screens (dl -ui): what it shows after each tap.
+ui() { dl -ui -b "$(b64 "$1")"; }
+tap() { ui "$(printf '%s\n' "$screen" | grep -F -- "$1" | head -n 1)"; }  # tap the line containing $1
+screen=$(ui @@start)
+check "ui: the main menu comes first" "$(printf '%s\n' "$screen" | head -n 1)" "📥 Downloads · "
+check "ui: main menu offers the Downloads folder" "$screen" "📂 Open the Downloads folder"
+check "ui: Open the Downloads folder gives a Files link" "$(tap '📂')" "shareddocuments://$DL_SHARE"
+check "ui: Close" "$(tap '❌')" "@@exit"
+check "ui: Add link from clipboard" "$(tap '➕')" "@@clipboard"
+check "ui: Open iSH-AOK" "$(tap '📲')" "@@app"
+mkdir "$DL_DIR/.logs/.updating"
+printf '=== update now\n=== step 1 Alpine packages\n=== step 2 yt-dlp\n' >>"$DL_DIR/.logs/.update.log"
+check "ui: an update shows its progress" "$(ui '')" "🔧 Updating · 2 of 3: yt-dlp ▰▰▰▱▱▱▱▱▱▱"
+rmdir "$DL_DIR/.logs/.updating"
+
+dl "$SLOW_PAGE" >/dev/null
+screen=$(ui @@start)
+screen=$(tap '📥 Downloads')
+check "ui: the list starts with Back" "$(printf '%s\n' "$screen" | head -n 1)" "⬅️ Back"
+finished=$(printf '%s\n' "$screen" | grep -c -E '^(✅|⚠️) ')
+[ "$finished" -le 6 ] && echo "ok    ui: the list keeps at most 6 finished downloads" ||
+  { echo "FAIL  ui: $finished finished downloads listed"; fails=$((fails + 1)); }
+check "ui: tapping a finished download opens it in Files" "$(tap '✅ Rabbit test page')" \
+  "shareddocuments://$DL_SHARE/Rabbit%20test%20page%20%281%29.mp4"
+for try in $(seq 40); do line_for '#10' | grep -q '% · ' && break; sleep 1; done
+screen=$(ui '')
+screen=$(tap 'Slow page')
+check "ui: tapping a running download shows its screen" "$screen" "⏸ Pause
+⏹ Stop and delete"
+ls "$DL_DIR" | grep -q '^Slow page.*\.part$' && echo "ok    the slow video is part-way" ||
+  { echo "FAIL  no partial file for the slow video"; ls "$DL_DIR"; fails=$((fails + 1)); }
+screen=$(tap '⏹ Stop and delete')
+check "ui: stopping says so, back on the list" "$screen" "ℹ️ Stopped Slow page"
+printf '%s\n' "$screen" | grep 'Slow page' | grep -q ' #[0-9]' &&
+  { echo "FAIL  ui: the stopped download is still listed"; fails=$((fails + 1)); } ||
+  echo "ok    ui: the stopped download leaves the list"
+ls "$DL_DIR" | grep -q '^Slow page' && { echo "FAIL  stop left files behind"; ls "$DL_DIR"; fails=$((fails + 1)); } ||
+  echo "ok    stop deletes the partial files"
+screen=$(tap 'Nobody Shares This')
+screen=$(tap '⏹ Stop and delete')
+check "ui: stopping a magnet" "$screen" "ℹ️ Stopped Nobody Shares This"
+check "ui: Back goes to the main menu" "$(tap '⬅️ Back')" "📥 Downloads"
 
 dl -p >/dev/null
 out=$(act "🧹 Clear finished")

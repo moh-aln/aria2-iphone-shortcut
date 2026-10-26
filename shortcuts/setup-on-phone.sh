@@ -215,10 +215,14 @@ segment() { # segment <id>: the log since the download's latest (re)start
 # "🔧 Update tools" in the menu does it at once.
 update_tools() {
   echo "=== update $(date)"
+  # "=== step N <what>" lines are what the menu shows while this runs.
+  echo "=== step 1 Alpine packages"
   timeout 600 apk update -q && timeout 1800 apk add -q -u aria2 curl ffmpeg nodejs quickjs
+  echo "=== step 2 yt-dlp"
   case $(command -v yt-dlp) in /usr/local/bin/*) timeout 600 yt-dlp -U ;; esac
   # The setup script installs dl and, when it changed, a new signed shortcut. Run the
   # repository's copy only when it differs from the one last run here.
+  echo "=== step 3 dl and the shortcut"
   if timeout 120 curl -fsSL -o "$JOBS/.setup.new" "$UPDATE_URL" &&
       [ "$(sha256sum <"$JOBS/.setup.new" | cut -d' ' -f1)" != "$(cat "$JOBS/.setup" 2>/dev/null)" ]; then
     echo "=== new setup"
@@ -240,6 +244,14 @@ update_now() {
 update_if_due() {
   last=$(cat "$JOBS/.updated" 2>/dev/null)
   [ $(($(date +%s) - ${last:-0})) -ge 86400 ] && update_now
+}
+
+update_progress() {  # e.g. "Updating · 2 of 3: yt-dlp ▰▰▰▱▱▱▱▱▱▱"
+  now=$(awk '/^=== update/ { s = "" } /^=== step / { s = $3 " " substr($0, index($0, $4)) } END { print s }' \
+    "$JOBS/.update.log" 2>/dev/null)
+  n=${now%% *}
+  case $n in 1 | 2 | 3) ;; *) n=1 now="1 starting" ;; esac
+  echo "Updating · $n of 3: ${now#* } $(bar $(((n - 1) * 33)))"
 }
 
 versions() {
@@ -270,6 +282,9 @@ deliver() {  # deliver <id>: move the finished download into $SHARE, if that's m
   # A playlist's or a torrent's file is in a folder: move that whole folder.
   top=${path#"$DEST"/}
   top=${top%%/*}
+  # The list shows this size afterwards, so it never has to look inside the Files folder:
+  # reading there goes through iOS's file coordination, which can hold up the Files app.
+  echo "=== size $(du -sh "$DEST/$top" 2>/dev/null | cut -f1)"
   echo "=== moving to Files"
   if [ -d "$DEST/$top" ]; then
     # Merge into a folder of the same name, file by file, leaving out the partial files
@@ -335,6 +350,13 @@ load() {
   step=$(printf '%s\n' "$seg" | grep -E '^\[[A-Za-z:_]+\] ' | grep -v -E '^\[(Exec|download)\]' |
     tail -n 1 | sed 's/^\(\[[^]]*\] \)*//; s/^[^ :]*: //' | cut -c1-48)
   case $seg in *'=== moving to Files'*) step='moving to Files' pct= ;; esac
+  [ "$state" = running ] && [ -z "$pct" ] && preparing
+  size=
+  if [ "$state" = done ]; then
+    size=$(printf '%s\n' "$seg" | sed -n 's/^=== size //p' | tail -n 1)
+    # Look at the file itself only when it's still in $DEST (see deliver).
+    case $path in "$SHARE"/* | '') ;; *) [ -n "$size" ] || size=$(du -sh "$path" 2>/dev/null | cut -f1) ;; esac
+  fi
   # A playlist: "[download] Downloading playlist: <title>", then "Downloading item 3 of 12"
   # before each video, and a FILE: line for each video that finished.
   playlist=$(printf '%s\n' "$seg" | sed -n 's/^\[download\] Downloading playlist: //p' | tail -n 1)
@@ -348,7 +370,30 @@ load() {
   errors=$(printf '%s\n' "$seg" | grep -c '^ERROR: ')
   # Some videos failing doesn't make the playlist a failure.
   [ "$state" = failed ] && [ "$videos" -gt 0 ] && state=done
-  [ -f "$path" ] && path=${path%/*}  # its folder, for the size
+  case $path in "$DEST"/*/*) path=${path%/*} ;; esac  # a video in its folder: the folder
+  if [ "$state" = done ] && [ -z "$size" ]; then
+    case $path in "$SHARE"/*) ;; *) size=$(du -sh "$path" 2>/dev/null | cut -f1) ;; esac
+  fi
+}
+
+# Before a download starts there's preparation: for YouTube a minute or more, mostly
+# "Solving JS challenges". Each step yt-dlp reports stands for a share of it.
+preparing() {
+  case $step in
+    *'Extracting URL'*) prep=8 label='opening the link' ;;
+    *'Downloading webpage'*) prep=15 label='reading the page' ;;
+    *'API JSON'*) prep=25 label='asking for the formats' ;;
+    *'Downloading player'*) prep=35 label="getting YouTube's player" ;;
+    *'Solving JS challenges'*) prep=50 label='unlocking the video link, about a minute' ;;
+    *'Extracting information'*) prep=50 label='looking for the video' ;;
+    *m3u8* | *MPD*) prep=80 label='getting the list of streams' ;;
+    *'format(s)'*) prep=95 label='about to start' ;;
+    'moving to Files') prep=100 label='moving to Files' ;;
+    '')
+      prep=3 label='starting'
+      case $link in magnet:*) prep=10 label='looking for peers' ;; esac ;;
+    *) prep=50 label=$step ;;
+  esac
 }
 
 bar() {
@@ -370,13 +415,13 @@ line() {
     running)
       if [ -n "$pct" ]; then
         echo "⬇️ $(bar "$pct") $pct% · $name · ${speed:-0B}/s${eta:+ · $eta left}  #$1"
+      elif [ "$label" = 'moving to Files' ]; then
+        echo "📦 moving to Files… · $name  #$1"
       else
-        echo "⬇️ ${step:-starting}… · $name  #$1"
+        echo "⏳ $(bar "$prep") $prep% preparing · $label… · $name  #$1"
       fi ;;
     paused) echo "⏸ ${pct:+$(bar "$pct") $pct% · }$name · paused  #$1" ;;
-    done)
-      size=$(du -sh "$path" 2>/dev/null | cut -f1)
-      echo "✅ $name${size:+ · $size}  #$1" ;;
+    done) echo "✅ $name${size:+ · $size}  #$1" ;;
     failed) echo "⚠️ $name · failed${reason:+: $reason}  #$1" ;;
   esac
 }
@@ -388,12 +433,11 @@ playlist_line() {
       if [ -n "$pct" ]; then
         now="$pct% · ${speed:-0B}/s"
       else
-        now="${step:-starting}…"
+        now="preparing · $label…"
       fi
       echo "⬇️ $(bar "$overall") video $n of $total · $now · $name  #$1" ;;
     paused) echo "⏸ $(bar "$overall") video $n of $total · $name · paused  #$1" ;;
     done)
-      size=$(du -sh "$path" 2>/dev/null | cut -f1)
       failed=
       [ "$errors" -gt 0 ] && failed=", $errors failed"
       echo "✅ $name · $videos videos$failed${size:+ · $size}  #$1" ;;
@@ -495,7 +539,8 @@ clear_finished() {
   echo "Cleared $n finished download(s). The files are still in Downloads."
 }
 
-# The Shortcut shows these under the downloads. It handles ➕, 📲 and ❌ itself.
+# dl -m and dl -a are the menu of the first single shortcut, kept for phones that haven't
+# imported the newer one (see dl -ui below). It handles ➕, 📲 and ❌ itself.
 actions() {
   # An update that brought a new shortcut says where it is, until this line is tapped.
   [ -s "$SHORTCUTS/.pending" ] &&
@@ -530,7 +575,233 @@ update_in_background() {
   echo "Updating yt-dlp and the other tools in the background."
 }
 
+# ---- The Shortcut's screens ----
+#
+# The Shortcut runs `dl -ui -b '<the line tapped, base64>'` again and again and shows what
+# it prints as a list to tap: "@@start" when it opens, and nothing after it handled a tap
+# itself. A few answers it acts on instead of showing them:
+#   shareddocuments://…   opens that file or folder in the Files app
+#   @@clipboard           adds the link on the clipboard
+#   @@app                 opens iSH-AOK
+#   @@exit                closes
+# So every screen lives here, and changing one never needs a new shortcut. The screen on
+# show is kept in $JOBS/.screen ("main", "list" or "item <id>"), and a message for the
+# next screen in $JOBS/.notice.
+
+KEEP_FINISHED=6  # finished downloads the list keeps; older ones drop off it (files stay)
+
+ui() {  # ui <tapped line>
+  screen=$(cat "$JOBS/.screen" 2>/dev/null)
+  case $1 in
+    @@start) screen=main ;;
+    '') ;;
+    *) tapped "$1" || return 0 ;;
+  esac
+  echo "$screen" >"$JOBS/.screen"
+  if [ -s "$JOBS/.notice" ]; then
+    echo "ℹ️ $(cat "$JOBS/.notice")"
+    : >"$JOBS/.notice"
+  fi
+  case $screen in
+    list) list_screen ;;
+    item\ *) item_screen "${screen#item }" ;;
+    *) main_screen ;;
+  esac
+}
+
+notice() { printf '%s\n' "$1" >"$JOBS/.notice"; }
+
+main_screen() {
+  # An update that brought a new shortcut says where it is, until this line is tapped.
+  [ -s "$SHORTCUTS/.pending" ] &&
+    echo "🆕 New shortcut: $(cat "$SHORTCUTS/.pending"). Open it, tap Replace, then tap here."
+  echo "📥 Downloads$(summary)"
+  echo "➕ Add link from clipboard"
+  echo "📂 Open the Downloads folder"
+  if [ -d "$JOBS/.updating" ]; then echo "🔧 $(update_progress)"; else echo "🔧 Update tools"; fi
+  echo "📲 Open iSH-AOK"
+  echo "❌ Close"
+}
+
+summary() {  # e.g. " · 1 downloading, 3 finished"
+  running=0 paused=0 finished=0
+  for id in $(ids); do
+    load "$id"
+    case $state in
+      running) running=$((running + 1)) ;;
+      paused) paused=$((paused + 1)) ;;
+      *) finished=$((finished + 1)) ;;
+    esac
+  done
+  s=
+  [ $running = 0 ] || s="$s, $running downloading"
+  [ $paused = 0 ] || s="$s, $paused paused"
+  [ $finished = 0 ] || s="$s, $finished finished"
+  printf '%s' "${s:+ · ${s#, }}"
+}
+
+list_screen() {
+  prune
+  echo "⬅️ Back"
+  status
+  echo "⏸ Pause all"
+  echo "▶️ Resume all"
+  echo "🧹 Clear finished"
+  echo "🔄 Refresh"
+}
+
+item_screen() {  # item_screen <id>
+  if [ ! -f "$JOBS/$1.log" ]; then
+    echo list >"$JOBS/.screen"
+    list_screen
+    return
+  fi
+  echo "⬅️ Back"
+  load "$1"
+  line "$1"
+  case $state in
+    running) echo "⏸ Pause"; echo "⏹ Stop and delete" ;;
+    paused) echo "▶️ Resume"; echo "⏹ Stop and delete" ;;
+    failed) echo "🔁 Try again"; echo "🗑 Remove from the list" ;;
+    done) echo "▶️ Open"; echo "🗑 Remove from the list (the file stays)" ;;
+  esac
+}
+
+tapped() {  # tapped <line>: act on it. Fails after printing an answer the Shortcut acts on.
+  case $screen in
+    list)
+      case $1 in
+        '⬅️ '*) screen=main ;;
+        *' #'[0-9]*) open_or_show "${1##*#}" || return 1 ;;
+        *'Pause all') notice "$(pause_all)" ;;
+        *'Resume all') notice "$(resume_all)" ;;
+        *'Clear finished') notice "$(clear_finished)" ;;
+      esac ;;
+    item\ *)
+      id=${screen#item }
+      case $1 in
+        '⬅️ '*) screen=list ;;
+        '⏸ Pause') pause "$id"; rest_unless_busy ;;
+        '▶️ Resume' | '🔁 Try again') load "$id"; start "$link" "$id" ;;
+        '⏹ '*) notice "$(stop "$id")"; screen=list ;;
+        '🗑 '*) load "$id"; forget "$id"; notice "Removed $name from the list."; screen=list ;;
+        '▶️ Open') open_or_show "$id" || return 1 ;;
+      esac ;;
+    *)
+      case $1 in
+        '🆕 '*) rm -f "$SHORTCUTS/.pending" ;;
+        '📥 '*) screen=list ;;
+        '➕ '*) echo @@clipboard; return 1 ;;
+        '📂 '*) files_url "$SHARE" || echo "shareddocuments://"; return 1 ;;
+        '🔧 '*) [ -d "$JOBS/.updating" ] || update_in_background >/dev/null ;;
+        '📲 '*) echo @@app; return 1 ;;
+        '❌ '*) echo @@exit; return 1 ;;
+      esac ;;
+  esac
+  return 0
+}
+
+# A finished download opens in the Files app; any other shows its own screen.
+open_or_show() {  # open_or_show <id>
+  load "$1"
+  if [ "$state" != done ]; then
+    screen="item $1"
+    return 0
+  fi
+  case $path in
+    "$SHARE"/*)
+      files_url "$path" || echo "shareddocuments://"
+      return 1 ;;
+  esac
+  notice "$name is in iSH-AOK's own Downloads folder. To get downloads in a Files folder, mount one in iSH-AOK: mount -t ios phone /mnt/phone"
+  return 0
+}
+
+# shareddocuments://<iOS path> opens a file or folder in the Files app. iSH-AOK lists the
+# iOS path of the folder mounted at $SHARE as that mount's source in /proc/mounts.
+files_url() {  # files_url <path at or under $SHARE>
+  case $1 in "$SHARE" | "$SHARE"/*) ;; *) return 1 ;; esac
+  host=$(share_host)
+  case $host in /*) ;; *) return 1 ;; esac
+  printf 'shareddocuments://%s\n' "$(urlencode "$host${1#"$SHARE"}")"
+}
+
+share_host() {
+  if [ -n "$DL_SHARE" ]; then  # tests: the folder stands for itself
+    printf %s "$SHARE"
+    return
+  fi
+  # Fields are separated by spaces, so a space in a path is written \040 (and \ as \134).
+  sed -n "s|^\([^ ]*\) $SHARE [^ ]* .*|\1|p" /proc/mounts 2>/dev/null | head -n 1 |
+    sed 's/\\040/ /g; s/\\134/\\/g'
+}
+
+urlencode() {  # percent-encode all but letters, digits, - . _ ~ and /
+  printf %s "$1" | od -An -tx1 -v | awk '
+    BEGIN {
+      for (i = 32; i < 127; i++) {
+        c = sprintf("%c", i)
+        if (c ~ /[A-Za-z0-9._~\/-]/) keep[sprintf("%02x", i)] = c
+      }
+    }
+    { for (i = 1; i <= NF; i++) out = out (($i in keep) ? keep[$i] : "%" toupper($i)) }
+    END { printf "%s", out }'
+}
+
+# Keep the list short: only the newest $KEEP_FINISHED finished downloads stay on it.
+prune() {
+  kept=0
+  for id in $(ids); do
+    load "$id"
+    case $state in
+      done | failed)
+        kept=$((kept + 1))
+        [ $kept -gt $KEEP_FINISHED ] && forget "$id" ;;
+    esac
+  done
+}
+
+forget() { rm -f "$JOBS/$1.log" "$JOBS/$1.pid"; }  # forget <id>: drop it from the list
+
+# Stop a download for good: delete what it left unfinished and drop it from the list.
+# Videos of a playlist that did finish are kept, and moved to Files like any download.
+stop() {  # stop <id>
+  load "$1"
+  title=$name
+  [ "$state" = running ] && pause "$1"
+  rest_unless_busy
+  if [ "$(segment "$1" | sed -n 's/^=== via //p' | tail -n 1)" = yt-dlp ]; then
+    # yt-dlp names each file it starts ("[download] Destination: …"), and says FILE: for
+    # each one it finished.
+    finished=$(segment "$1" | sed -n 's/^FILE: //p')
+    segment "$1" | sed -n 's/^\[download\] Destination: //p' | while IFS= read -r p; do
+      printf '%s\n' "$finished" | grep -qxF -- "$p" || unfinished "$p"
+    done
+    deliver "$1" >>"$JOBS/$1.log"
+  else
+    # aria2 names its file (a torrent's first file) in FILE: lines while it downloads.
+    segment "$1" | sed -n 's/^FILE: //p' | sort -u | while IFS= read -r p; do
+      unfinished "$p"
+      top=${p#"$DEST"/}
+      top=${top%%/*}
+      # A torrent downloads into a folder of its own, with its .aria2 file next to it.
+      if [ -n "$top" ] && [ "$top" != "${p#"$DEST"/}" ] && [ -d "$DEST/$top" ]; then
+        rm -rf "${DEST:?}/$top"
+        rm -f "$DEST/$top.aria2"
+      fi
+    done
+  fi
+  forget "$1"
+  echo "Stopped $title and deleted what it had downloaded."
+}
+
+unfinished() {  # unfinished <path>: delete a partial download, only ever inside $DEST
+  case $1 in "$DEST"/?*) ;; *) return 0 ;; esac
+  rm -f "$1" "$1.part" "$1.ytdl" "$1.aria2" "$1".part-Frag*
+}
+
 case $1 in
+  -ui) ui "$(decode "$3")" ;;
   --work) work "$2" ;;
   --update) keep_awake; update_now; rest_unless_busy ;;
   -u) update_in_background ;;
@@ -555,27 +826,27 @@ date +%s >/root/Downloads/.logs/.updated
 sha256sum <"$0" | cut -d' ' -f1 >/root/Downloads/.logs/.setup
 echo "Installed dl."
 
-# The shortcut only needs importing again when it changed: aed6cbcf identifies this one.
+# The shortcut only needs importing again when it changed: c819f7f3 identifies this one.
 mkdir -p /root/Shortcuts
 cd /root/Shortcuts || exit 1
 rm -f "Download with aria2.shortcut" "Download Status.shortcut" "Stop Downloads.shortcut"
 new_shortcut=
-if [ "$(cat .version 2>/dev/null)" = aed6cbcf ] && [ -e aria2.shortcut ]; then
+if [ "$(cat .version 2>/dev/null)" = c819f7f3 ] && [ -e aria2.shortcut ]; then
   echo "The aria2 shortcut hasn't changed: no need to import it again."
 elif ! curl -sS -m 90 -X POST -H 'Content-Type: application/json' --data-binary @- \
     https://hubsign.routinehub.services/sign -o aria2.shortcut <<'EOF'
-{"shortcutName": "aria2", "shortcut": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict><key>WFQuickActionSurfaces</key><array/><key>WFWorkflowActions</key><array><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>E1F4B6AD-67A9-59C2-BF5A-CB1B74923CCD</string><key>WFCondition</key><integer>100</integer><key>WFControlFlowMode</key><integer>0</integer><key>WFInput</key><dict><key>Type</key><string>Variable</string><key>Variable</key><dict><key>Value</key><dict><key>Type</key><string>ExtensionInput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.gettext</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>BED918ED-F354-5434-BA9E-D905CB142757</string><key>WFTextActionText</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{0, 1}</key><dict><key>Type</key><string>ExtensionInput</string></dict></dict><key>string</key><string>\ufffc</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.base64encode</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>B97D1C35-25A7-5189-A47A-7D4F94C5F127</string><key>WFEncodeMode</key><string>Encode</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Text</string><key>OutputUUID</key><string>BED918ED-F354-5434-BA9E-D905CB142757</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>app.ish.iSH-AOK.ISHRunCommandIntent</string><key>WFWorkflowActionParameters</key><dict><key>AppIntentDescriptor</key><dict><key>AppIntentIdentifier</key><string>ISHRunCommandIntent</string><key>BundleIdentifier</key><string>app.ish.iSH-AOK</string><key>Name</key><string>iSH-AOK</string><key>TeamIdentifier</key><string>UYU5FM4LQ4</string></dict><key>UUID</key><string>EA3FF6EE-418E-5F16-A20E-4F532F08F4A8</string><key>command</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{7, 1}</key><dict><key>OutputName</key><string>Base64 Encoded</string><key>OutputUUID</key><string>B97D1C35-25A7-5189-A47A-7D4F94C5F127</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>dl -b '\ufffc'</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.notification</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>24F635B4-38FF-5407-BDEC-39229497076E</string><key>WFNotificationActionBody</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{0, 1}</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>EA3FF6EE-418E-5F16-A20E-4F532F08F4A8</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>\ufffc</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict><key>WFNotificationActionTitle</key><string>aria2</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.exit</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>D48DE1D5-0ADD-51BD-A2AF-E7E1F145CFCA</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>E1F4B6AD-67A9-59C2-BF5A-CB1B74923CCD</string><key>UUID</key><string>D0999766-74CF-55F4-9C0C-44D58EB1FB11</string><key>WFControlFlowMode</key><integer>2</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.repeat.count</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>6C3A90F4-177F-5D72-B348-2C15796D58F4</string><key>WFControlFlowMode</key><integer>0</integer><key>WFRepeatCount</key><integer>200</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>app.ish.iSH-AOK.ISHRunCommandIntent</string><key>WFWorkflowActionParameters</key><dict><key>AppIntentDescriptor</key><dict><key>AppIntentIdentifier</key><string>ISHRunCommandIntent</string><key>BundleIdentifier</key><string>app.ish.iSH-AOK</string><key>Name</key><string>iSH-AOK</string><key>TeamIdentifier</key><string>UYU5FM4LQ4</string></dict><key>UUID</key><string>C2269D23-F4DF-5D8C-A0CC-557EAD7601C7</string><key>command</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict/><key>string</key><string>dl -m</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.text.split</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>1E6D665A-7B0B-53F7-A21F-489548C775A4</string><key>WFTextSeparator</key><string>New Lines</string><key>text</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{0, 1}</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>C2269D23-F4DF-5D8C-A0CC-557EAD7601C7</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>\ufffc</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.choosefromlist</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>F198A729-B979-5AEA-A1A9-F53CFB201E53</string><key>WFChooseFromListActionPrompt</key><string>Tap a download to pause or resume it.</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Split Text</string><key>OutputUUID</key><string>1E6D665A-7B0B-53F7-A21F-489548C775A4</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>4F1124D2-903A-5DC7-B601-9FFB02E393FF</string><key>WFCondition</key><integer>99</integer><key>WFConditionalActionString</key><string>\u274c</string><key>WFControlFlowMode</key><integer>0</integer><key>WFInput</key><dict><key>Type</key><string>Variable</string><key>Variable</key><dict><key>Value</key><dict><key>OutputName</key><string>Chosen Item</string><key>OutputUUID</key><string>F198A729-B979-5AEA-A1A9-F53CFB201E53</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.exit</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>2179F174-6518-577C-8BC8-559B77F5C121</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>4F1124D2-903A-5DC7-B601-9FFB02E393FF</string><key>UUID</key><string>DD1EE042-CEF0-54E5-A149-CCFE81FC904B</string><key>WFControlFlowMode</key><integer>2</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>FE6DC3C4-E47E-59B7-91C9-60BE4EF0460E</string><key>WFCondition</key><integer>99</integer><key>WFConditionalActionString</key><string>\ud83d\udcf2</string><key>WFControlFlowMode</key><integer>0</integer><key>WFInput</key><dict><key>Type</key><string>Variable</string><key>Variable</key><dict><key>Value</key><dict><key>OutputName</key><string>Chosen Item</string><key>OutputUUID</key><string>F198A729-B979-5AEA-A1A9-F53CFB201E53</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.openapp</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>5C78ED84-535E-5629-981D-D11D0C9CD6B6</string><key>WFAppIdentifier</key><string>app.ish.iSH-AOK</string><key>WFSelectedApp</key><dict><key>BundleIdentifier</key><string>app.ish.iSH-AOK</string><key>Name</key><string>iSH-AOK</string><key>TeamIdentifier</key><string>UYU5FM4LQ4</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.exit</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>5065E054-14A7-5BD2-B4AB-2D7C3AE4DD08</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>FE6DC3C4-E47E-59B7-91C9-60BE4EF0460E</string><key>UUID</key><string>A28B8443-B7AA-537B-B71C-C2B2FAF269DC</string><key>WFControlFlowMode</key><integer>2</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>F354A175-D460-5F86-B1E5-C4326E8A1709</string><key>WFCondition</key><integer>99</integer><key>WFConditionalActionString</key><string>\u2795</string><key>WFControlFlowMode</key><integer>0</integer><key>WFInput</key><dict><key>Type</key><string>Variable</string><key>Variable</key><dict><key>Value</key><dict><key>OutputName</key><string>Chosen Item</string><key>OutputUUID</key><string>F198A729-B979-5AEA-A1A9-F53CFB201E53</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.getclipboard</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>B5AC4394-0DF3-5820-9CDE-6D5CB16611B8</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.gettext</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>0CCC5D47-58B8-565C-AC50-6F6D286A4C50</string><key>WFTextActionText</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{0, 1}</key><dict><key>OutputName</key><string>Clipboard</string><key>OutputUUID</key><string>B5AC4394-0DF3-5820-9CDE-6D5CB16611B8</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>\ufffc</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.base64encode</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>E247B0C6-41BF-5EC8-B143-B0826DDCDABF</string><key>WFEncodeMode</key><string>Encode</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Text</string><key>OutputUUID</key><string>0CCC5D47-58B8-565C-AC50-6F6D286A4C50</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>app.ish.iSH-AOK.ISHRunCommandIntent</string><key>WFWorkflowActionParameters</key><dict><key>AppIntentDescriptor</key><dict><key>AppIntentIdentifier</key><string>ISHRunCommandIntent</string><key>BundleIdentifier</key><string>app.ish.iSH-AOK</string><key>Name</key><string>iSH-AOK</string><key>TeamIdentifier</key><string>UYU5FM4LQ4</string></dict><key>UUID</key><string>3E48D5EC-CDD1-5903-8C4C-7DE4B0B64027</string><key>command</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{7, 1}</key><dict><key>OutputName</key><string>Base64 Encoded</string><key>OutputUUID</key><string>E247B0C6-41BF-5EC8-B143-B0826DDCDABF</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>dl -b '\ufffc'</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.notification</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>36777070-17A6-5E65-9712-079317FF9FB6</string><key>WFNotificationActionBody</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{0, 1}</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>3E48D5EC-CDD1-5903-8C4C-7DE4B0B64027</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>\ufffc</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict><key>WFNotificationActionTitle</key><string>aria2</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>F354A175-D460-5F86-B1E5-C4326E8A1709</string><key>WFControlFlowMode</key><integer>1</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.gettext</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>429A86DB-F4BA-5E43-A602-4A1B8D55B326</string><key>WFTextActionText</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{0, 1}</key><dict><key>OutputName</key><string>Chosen Item</string><key>OutputUUID</key><string>F198A729-B979-5AEA-A1A9-F53CFB201E53</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>\ufffc</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.base64encode</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>666AA480-0920-529E-9707-AB30625979FF</string><key>WFEncodeMode</key><string>Encode</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Text</string><key>OutputUUID</key><string>429A86DB-F4BA-5E43-A602-4A1B8D55B326</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>app.ish.iSH-AOK.ISHRunCommandIntent</string><key>WFWorkflowActionParameters</key><dict><key>AppIntentDescriptor</key><dict><key>AppIntentIdentifier</key><string>ISHRunCommandIntent</string><key>BundleIdentifier</key><string>app.ish.iSH-AOK</string><key>Name</key><string>iSH-AOK</string><key>TeamIdentifier</key><string>UYU5FM4LQ4</string></dict><key>UUID</key><string>38885350-296C-58C8-8969-65B615371003</string><key>command</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{10, 1}</key><dict><key>OutputName</key><string>Base64 Encoded</string><key>OutputUUID</key><string>666AA480-0920-529E-9707-AB30625979FF</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>dl -a -b '\ufffc'</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>F354A175-D460-5F86-B1E5-C4326E8A1709</string><key>UUID</key><string>F1E85EB1-E09A-54C1-9DCD-114948B8FED0</string><key>WFControlFlowMode</key><integer>2</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.repeat.count</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>6C3A90F4-177F-5D72-B348-2C15796D58F4</string><key>UUID</key><string>69362F2D-F688-5A92-AD91-1D1940C479F8</string><key>WFControlFlowMode</key><integer>2</integer></dict></dict></array><key>WFWorkflowClientVersion</key><string>4033.0.4.3</string><key>WFWorkflowHasOutputFallback</key><false/><key>WFWorkflowHasShortcutInputVariables</key><true/><key>WFWorkflowIcon</key><dict><key>WFWorkflowIconGlyphNumber</key><integer>59693</integer><key>WFWorkflowIconStartColor</key><integer>431817727</integer></dict><key>WFWorkflowImportQuestions</key><array/><key>WFWorkflowInputContentItemClasses</key><array><string>WFURLContentItem</string><string>WFStringContentItem</string></array><key>WFWorkflowMinimumClientVersion</key><integer>900</integer><key>WFWorkflowMinimumClientVersionString</key><string>900</string><key>WFWorkflowOutputContentItemClasses</key><array/><key>WFWorkflowTypes</key><array><string>ActionExtension</string></array></dict></plist>\n"}
+{"shortcutName": "aria2", "shortcut": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict><key>WFQuickActionSurfaces</key><array/><key>WFWorkflowActions</key><array><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>E1F4B6AD-67A9-59C2-BF5A-CB1B74923CCD</string><key>WFCondition</key><integer>100</integer><key>WFControlFlowMode</key><integer>0</integer><key>WFInput</key><dict><key>Type</key><string>Variable</string><key>Variable</key><dict><key>Value</key><dict><key>Type</key><string>ExtensionInput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.gettext</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>BED918ED-F354-5434-BA9E-D905CB142757</string><key>WFTextActionText</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{0, 1}</key><dict><key>Type</key><string>ExtensionInput</string></dict></dict><key>string</key><string>\ufffc</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.base64encode</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>B97D1C35-25A7-5189-A47A-7D4F94C5F127</string><key>WFEncodeMode</key><string>Encode</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Text</string><key>OutputUUID</key><string>BED918ED-F354-5434-BA9E-D905CB142757</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>app.ish.iSH-AOK.ISHRunCommandIntent</string><key>WFWorkflowActionParameters</key><dict><key>AppIntentDescriptor</key><dict><key>AppIntentIdentifier</key><string>ISHRunCommandIntent</string><key>BundleIdentifier</key><string>app.ish.iSH-AOK</string><key>Name</key><string>iSH-AOK</string><key>TeamIdentifier</key><string>UYU5FM4LQ4</string></dict><key>UUID</key><string>EA3FF6EE-418E-5F16-A20E-4F532F08F4A8</string><key>command</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{7, 1}</key><dict><key>OutputName</key><string>Base64 Encoded</string><key>OutputUUID</key><string>B97D1C35-25A7-5189-A47A-7D4F94C5F127</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>dl -b '\ufffc'</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.notification</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>24F635B4-38FF-5407-BDEC-39229497076E</string><key>WFNotificationActionBody</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{0, 1}</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>EA3FF6EE-418E-5F16-A20E-4F532F08F4A8</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>\ufffc</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict><key>WFNotificationActionTitle</key><string>aria2</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.exit</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>D48DE1D5-0ADD-51BD-A2AF-E7E1F145CFCA</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>E1F4B6AD-67A9-59C2-BF5A-CB1B74923CCD</string><key>UUID</key><string>D0999766-74CF-55F4-9C0C-44D58EB1FB11</string><key>WFControlFlowMode</key><integer>2</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.gettext</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>6C3A90F4-177F-5D72-B348-2C15796D58F4</string><key>WFTextActionText</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict/><key>string</key><string>@@start</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.setvariable</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>C2269D23-F4DF-5D8C-A0CC-557EAD7601C7</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Text</string><key>OutputUUID</key><string>6C3A90F4-177F-5D72-B348-2C15796D58F4</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict><key>WFVariableName</key><string>tapped</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.repeat.count</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>1E6D665A-7B0B-53F7-A21F-489548C775A4</string><key>WFControlFlowMode</key><integer>0</integer><key>WFRepeatCount</key><integer>500</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.gettext</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>F198A729-B979-5AEA-A1A9-F53CFB201E53</string><key>WFTextActionText</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{0, 1}</key><dict><key>Type</key><string>Variable</string><key>VariableName</key><string>tapped</string></dict></dict><key>string</key><string>\ufffc</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.base64encode</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>4F1124D2-903A-5DC7-B601-9FFB02E393FF</string><key>WFEncodeMode</key><string>Encode</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Text</string><key>OutputUUID</key><string>F198A729-B979-5AEA-A1A9-F53CFB201E53</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>app.ish.iSH-AOK.ISHRunCommandIntent</string><key>WFWorkflowActionParameters</key><dict><key>AppIntentDescriptor</key><dict><key>AppIntentIdentifier</key><string>ISHRunCommandIntent</string><key>BundleIdentifier</key><string>app.ish.iSH-AOK</string><key>Name</key><string>iSH-AOK</string><key>TeamIdentifier</key><string>UYU5FM4LQ4</string></dict><key>UUID</key><string>FE6DC3C4-E47E-59B7-91C9-60BE4EF0460E</string><key>command</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{11, 1}</key><dict><key>OutputName</key><string>Base64 Encoded</string><key>OutputUUID</key><string>4F1124D2-903A-5DC7-B601-9FFB02E393FF</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>dl -ui -b '\ufffc'</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>F354A175-D460-5F86-B1E5-C4326E8A1709</string><key>WFCondition</key><integer>8</integer><key>WFConditionalActionString</key><string>shareddocuments:</string><key>WFControlFlowMode</key><integer>0</integer><key>WFInput</key><dict><key>Type</key><string>Variable</string><key>Variable</key><dict><key>Value</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>FE6DC3C4-E47E-59B7-91C9-60BE4EF0460E</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.openurl</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>5065E054-14A7-5BD2-B4AB-2D7C3AE4DD08</string><key>WFInput</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{0, 1}</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>FE6DC3C4-E47E-59B7-91C9-60BE4EF0460E</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>\ufffc</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.exit</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>A28B8443-B7AA-537B-B71C-C2B2FAF269DC</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>F354A175-D460-5F86-B1E5-C4326E8A1709</string><key>UUID</key><string>B5AC4394-0DF3-5820-9CDE-6D5CB16611B8</string><key>WFControlFlowMode</key><integer>2</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>2179F174-6518-577C-8BC8-559B77F5C121</string><key>WFCondition</key><integer>8</integer><key>WFConditionalActionString</key><string>@@exit</string><key>WFControlFlowMode</key><integer>0</integer><key>WFInput</key><dict><key>Type</key><string>Variable</string><key>Variable</key><dict><key>Value</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>FE6DC3C4-E47E-59B7-91C9-60BE4EF0460E</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.exit</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>0CCC5D47-58B8-565C-AC50-6F6D286A4C50</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>2179F174-6518-577C-8BC8-559B77F5C121</string><key>UUID</key><string>E247B0C6-41BF-5EC8-B143-B0826DDCDABF</string><key>WFControlFlowMode</key><integer>2</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>DD1EE042-CEF0-54E5-A149-CCFE81FC904B</string><key>WFCondition</key><integer>8</integer><key>WFConditionalActionString</key><string>@@app</string><key>WFControlFlowMode</key><integer>0</integer><key>WFInput</key><dict><key>Type</key><string>Variable</string><key>Variable</key><dict><key>Value</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>FE6DC3C4-E47E-59B7-91C9-60BE4EF0460E</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.openapp</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>3E48D5EC-CDD1-5903-8C4C-7DE4B0B64027</string><key>WFAppIdentifier</key><string>app.ish.iSH-AOK</string><key>WFSelectedApp</key><dict><key>BundleIdentifier</key><string>app.ish.iSH-AOK</string><key>Name</key><string>iSH-AOK</string><key>TeamIdentifier</key><string>UYU5FM4LQ4</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.exit</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>429A86DB-F4BA-5E43-A602-4A1B8D55B326</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>DD1EE042-CEF0-54E5-A149-CCFE81FC904B</string><key>UUID</key><string>666AA480-0920-529E-9707-AB30625979FF</string><key>WFControlFlowMode</key><integer>2</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>5C78ED84-535E-5629-981D-D11D0C9CD6B6</string><key>WFCondition</key><integer>8</integer><key>WFConditionalActionString</key><string>@@clipboard</string><key>WFControlFlowMode</key><integer>0</integer><key>WFInput</key><dict><key>Type</key><string>Variable</string><key>Variable</key><dict><key>Value</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>FE6DC3C4-E47E-59B7-91C9-60BE4EF0460E</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.getclipboard</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>38885350-296C-58C8-8969-65B615371003</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.gettext</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>36777070-17A6-5E65-9712-079317FF9FB6</string><key>WFTextActionText</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{0, 1}</key><dict><key>OutputName</key><string>Clipboard</string><key>OutputUUID</key><string>38885350-296C-58C8-8969-65B615371003</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>\ufffc</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.base64encode</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>F1E85EB1-E09A-54C1-9DCD-114948B8FED0</string><key>WFEncodeMode</key><string>Encode</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Text</string><key>OutputUUID</key><string>36777070-17A6-5E65-9712-079317FF9FB6</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>app.ish.iSH-AOK.ISHRunCommandIntent</string><key>WFWorkflowActionParameters</key><dict><key>AppIntentDescriptor</key><dict><key>AppIntentIdentifier</key><string>ISHRunCommandIntent</string><key>BundleIdentifier</key><string>app.ish.iSH-AOK</string><key>Name</key><string>iSH-AOK</string><key>TeamIdentifier</key><string>UYU5FM4LQ4</string></dict><key>UUID</key><string>69362F2D-F688-5A92-AD91-1D1940C479F8</string><key>command</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{7, 1}</key><dict><key>OutputName</key><string>Base64 Encoded</string><key>OutputUUID</key><string>F1E85EB1-E09A-54C1-9DCD-114948B8FED0</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>dl -b '\ufffc'</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.notification</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>47EE881A-114E-5499-B514-818ED46A4800</string><key>WFNotificationActionBody</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{0, 1}</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>69362F2D-F688-5A92-AD91-1D1940C479F8</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>\ufffc</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict><key>WFNotificationActionTitle</key><string>aria2</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.gettext</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>C5CFB350-B5E3-56AA-A5F6-5323C3F6C736</string><key>WFTextActionText</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict/><key>string</key><string></string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.setvariable</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>6EE464CB-F90C-58FB-B970-79F3FDF2827D</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Text</string><key>OutputUUID</key><string>C5CFB350-B5E3-56AA-A5F6-5323C3F6C736</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict><key>WFVariableName</key><string>tapped</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>5C78ED84-535E-5629-981D-D11D0C9CD6B6</string><key>WFControlFlowMode</key><integer>1</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.text.split</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>2728493E-8E4B-5E30-A9FE-ABAF2CCBAD1D</string><key>WFTextSeparator</key><string>New Lines</string><key>text</key><dict><key>Value</key><dict><key>attachmentsByRange</key><dict><key>{0, 1}</key><dict><key>OutputName</key><string>Run Command</string><key>OutputUUID</key><string>FE6DC3C4-E47E-59B7-91C9-60BE4EF0460E</string><key>Type</key><string>ActionOutput</string></dict></dict><key>string</key><string>\ufffc</string></dict><key>WFSerializationType</key><string>WFTextTokenString</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.choosefromlist</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>E337AF9F-B960-5D5A-8B66-701D83FAC389</string><key>WFChooseFromListActionPrompt</key><string>aria2</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Split Text</string><key>OutputUUID</key><string>2728493E-8E4B-5E30-A9FE-ABAF2CCBAD1D</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.setvariable</string><key>WFWorkflowActionParameters</key><dict><key>UUID</key><string>D8DC0482-9C60-5685-B933-34EF4510D812</string><key>WFInput</key><dict><key>Value</key><dict><key>OutputName</key><string>Chosen Item</string><key>OutputUUID</key><string>E337AF9F-B960-5D5A-8B66-701D83FAC389</string><key>Type</key><string>ActionOutput</string></dict><key>WFSerializationType</key><string>WFTextTokenAttachment</string></dict><key>WFVariableName</key><string>tapped</string></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.conditional</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>5C78ED84-535E-5629-981D-D11D0C9CD6B6</string><key>UUID</key><string>E3FC5DAF-C0FF-5042-8122-F695F89B57D7</string><key>WFControlFlowMode</key><integer>2</integer></dict></dict><dict><key>WFWorkflowActionIdentifier</key><string>is.workflow.actions.repeat.count</string><key>WFWorkflowActionParameters</key><dict><key>GroupingIdentifier</key><string>1E6D665A-7B0B-53F7-A21F-489548C775A4</string><key>UUID</key><string>458D9A09-77B6-5061-8314-6AB706925BD8</string><key>WFControlFlowMode</key><integer>2</integer></dict></dict></array><key>WFWorkflowClientVersion</key><string>4033.0.4.3</string><key>WFWorkflowHasOutputFallback</key><false/><key>WFWorkflowHasShortcutInputVariables</key><true/><key>WFWorkflowIcon</key><dict><key>WFWorkflowIconGlyphNumber</key><integer>59693</integer><key>WFWorkflowIconStartColor</key><integer>431817727</integer></dict><key>WFWorkflowImportQuestions</key><array/><key>WFWorkflowInputContentItemClasses</key><array><string>WFURLContentItem</string><string>WFStringContentItem</string></array><key>WFWorkflowMinimumClientVersion</key><integer>900</integer><key>WFWorkflowMinimumClientVersionString</key><string>900</string><key>WFWorkflowOutputContentItemClasses</key><array/><key>WFWorkflowTypes</key><array><string>ActionExtension</string></array></dict></plist>\n"}
 EOF
 then
   echo "FAILED to sign the shortcut: no answer from HubSign."
 elif [ "$(head -c 4 aria2.shortcut)" = AEA1 ]; then
-  echo aed6cbcf >.version
+  echo c819f7f3 >.version
   new_shortcut="Files -> iSH-AOK -> (Alpine) -> root -> Shortcuts -> aria2.shortcut"
   # Also put it in the Files folder mounted at /mnt/phone, under a name of its own: writing
   # over a file that Files has open there can hang.
   if awk '$2 == "/mnt/phone" { found = 1 } END { exit !found }' /proc/mounts 2>/dev/null &&
-      timeout 60 cp aria2.shortcut /mnt/phone/aria2-aed6cbcf.shortcut; then
-    new_shortcut="Files -> On My iPhone -> Downloads -> aria2-aed6cbcf.shortcut"
+      timeout 60 cp aria2.shortcut /mnt/phone/aria2-c819f7f3.shortcut; then
+    new_shortcut="Files -> On My iPhone -> Downloads -> aria2-c819f7f3.shortcut"
   fi
   # The download list shows where it is until it's tapped: an update may run this unseen.
   echo "$new_shortcut" >/root/Shortcuts/.pending
