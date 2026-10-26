@@ -52,6 +52,7 @@ Both run in Alpine Linux inside the [iSH-AOK](https://github.com/emkey1/ish-AOK)
 ➕ Add link from clipboard
 📂 Open the Downloads folder
 🔧 Update tools
+🔔 Turn on notifications
 📲 Open iSH-AOK
 ❌ Close
 ```
@@ -81,6 +82,20 @@ Both run in Alpine Linux inside the [iSH-AOK](https://github.com/emkey1/ish-AOK)
 
 All of these screens come from `dl` itself; the shortcut only shows them. So new menus arrive with `dl`'s updates, without importing a new shortcut.
 
+## Notifications
+
+`dl` can send a notification when a download finishes, saying what was downloaded. Tapping it opens the file (or a playlist's folder) in the Files app. A failed download gets one too.
+
+iSH-AOK can't post notifications itself, so they go through [Bark](https://github.com/Finb/Bark), a free, open-source notification app:
+
+1. Install **Bark** from the App Store, open it and allow its notifications.
+2. In Bark, tap the copy button next to any of its example links (they look like `https://api.day.app/<your key>/…`).
+3. Run aria2 and tap **🔔 Turn on notifications**, then **3️⃣ Then tap here**. (Sharing that Bark link to aria2 works too.)
+
+Bark sends a test notification straight away. **🔔 Notifications · on** in the menu has **🔔 Send a test notification** and **🔕 Turn off notifications**.
+
+Notifications are off until you do this. Once on, each notification's text (the file name, its size and its place in Files) goes to Bark's server at api.day.app, which hands it to Apple to deliver. Your key stays in iSH-AOK, in `/root/Downloads/.logs/.bark`.
+
 ## Updates
 
 Once a day, after a download, `dl` updates itself and its tools in the background. **🔧 Update tools** in the menu does it right away, and shows which of its 3 steps it's on. An update:
@@ -94,6 +109,7 @@ If the shortcut itself changed, the list shows a **🆕 New shortcut** line sayi
 
 ```
 dl <link>      download (or resume) a link
+dl <Bark link> turn on notifications
 dl -s          the list with progress bars
 dl -p | -r     pause all | resume all
 dl -c          clear finished from the list

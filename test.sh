@@ -27,7 +27,32 @@ port=18780
 export DL_UPDATE_URL=http://127.0.0.1:$port/setup.sh
 printf '#!/bin/sh\necho ran >>"%s/setup-runs"\nsha256sum <"$0" | cut -d" " -f1 >"$DL_DIR/.logs/.setup"\n' "$tmp" \
   >"$tmp/www/setup.sh"
-python3 -I -m http.server $port --bind 127.0.0.1 --directory "$tmp/www" >/dev/null 2>&1 &
+# The server also stands in for Bark's: it takes notifications for the key GOODKEY42 and
+# writes each one to bark.log, as JSON with its keys sorted.
+export DL_BARK=http://127.0.0.1:$port/bark
+cat >"$tmp/server.py" <<'PY'
+import functools, http.server, json, sys
+port, www, log = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+class Handler(http.server.SimpleHTTPRequestHandler):
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        if self.path != "/bark/GOODKEY42":
+            self.send_error(400, "failed to get device token")
+            return
+        try:
+            line = json.dumps(json.loads(body), ensure_ascii=False, sort_keys=True)
+        except ValueError:
+            line = "NOT JSON: " + body.decode("utf-8", "replace")
+        with open(log, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+        self.send_response(200)
+        self.end_headers()
+    def log_message(self, *args):
+        pass
+handler = functools.partial(Handler, directory=www)
+http.server.ThreadingHTTPServer(("127.0.0.1", port), handler).serve_forever()
+PY
+python3 -I "$tmp/server.py" $port "$tmp/www" "$tmp/bark.log" >/dev/null 2>&1 &
 server=$!
 trap 'kill $server; pkill -f "$tmp"; pkill -f "$here/dl --work"; rm -rf "$tmp"' EXIT
 
@@ -225,6 +250,57 @@ screen=$(tap 'Nobody Shares This')
 screen=$(tap '⏹ Stop and delete')
 check "ui: stopping a magnet" "$screen" "ℹ️ Stopped Nobody Shares This"
 check "ui: Back goes to the main menu" "$(tap '⬅️ Back')" "📥 Downloads"
+
+# Notifications, through the stand-in for Bark's server.
+[ ! -e "$tmp/bark.log" ] && echo "ok    no notifications before they're turned on" ||
+  { echo "FAIL  notifications were sent while they were off"; fails=$((fails + 1)); }
+screen=$(ui @@start)
+check "ui: the main menu offers notifications" "$screen" "🔔 Turn on notifications"
+screen=$(tap '🔔')
+check "ui: the notifications screen says how to turn them on" "$screen" "2️⃣ In Bark, tap the copy button"
+check "ui: 3️⃣ reads the clipboard" "$(tap '3️⃣')" "@@clipboard"
+before=$(ls "$DL_DIR/.logs" | grep -c '\.log$')
+out=$(dl -b "$(b64 "$SMALL?copied-by-mistake")")
+check "after 3️⃣, the clipboard has to have a Bark link" "$out" "There's no Bark link on the clipboard."
+[ "$(ls "$DL_DIR/.logs" | grep -c '\.log$')" = "$before" ] && echo "ok    ...and anything else on it isn't downloaded" ||
+  { echo "FAIL  after 3️⃣, the clipboard's link was downloaded"; fails=$((fails + 1)); }
+out=$(dl -b "$(b64 "$DL_BARK/WRONGKEY/Push content")")
+check "a Bark link that Bark doesn't take" "$out" "Bark didn't take that link, so notifications are still off."
+out=$(dl -b "$(b64 "Copied from Bark: $DL_BARK/GOODKEY42/Push%20content")")
+check "a Bark link turns notifications on" "$out" "Notifications are on. Bark just sent you a test one."
+check "...and sends a test notification" "$(cat "$tmp/bark.log")" '"title": "🔔 aria2 notifications are on"'
+screen=$(ui '')
+check "ui: the notifications screen once they're on" "$screen" "🔔 Send a test notification
+🔕 Turn off notifications"
+check "ui: sending a test notification" "$(tap '🔔 Send')" "ℹ️ Sent."
+check "...which opens the Downloads folder when tapped" "$(tail -n 1 "$tmp/bark.log")" "\"url\": \"shareddocuments://$DL_SHARE\""
+screen=$(tap '⬅️ Back')
+check "ui: the main menu says they're on" "$screen" "🔔 Notifications · on"
+
+printf 'hello\n' >"$tmp/www/note.txt"
+printf 'hello\n' >"$tmp/www/say\"hi\".txt"
+dl "http://127.0.0.1:$port/note.txt" "http://127.0.0.1:$port/say%22hi%22.txt" "http://127.0.0.1:$port/missing.zip" >/dev/null
+notified() { grep -F -- "$1" "$tmp/bark.log"; }
+for try in $(seq 60); do
+  notified note.txt >/dev/null && notified 'say\"hi\"' >/dev/null && notified missing.zip >/dev/null && break
+  sleep 1
+done
+check "a finished download sends a notification" "$(notified note.txt)" '"body": "note.txt · '
+check "...saying it's downloaded" "$(notified note.txt)" '"title": "✅ Downloaded"'
+check "...which opens the file when tapped" "$(notified note.txt)" "\"url\": \"shareddocuments://$DL_SHARE/note.txt\""
+check "a name with quotes in it" "$(notified say)" '"body": "say\"hi\".txt · '
+check "a failed download sends a notification" "$(notified missing.zip)" '"title": "⚠️ Download failed"'
+grep -q '^NOT JSON' "$tmp/bark.log" && { echo "FAIL  a notification wasn't valid JSON"; fails=$((fails + 1)); } ||
+  echo "ok    every notification is valid JSON"
+
+screen=$(tap '🔔')
+screen=$(tap '🔕')
+check "ui: turning notifications off" "$screen" "ℹ️ Notifications are off."
+[ ! -e "$DL_DIR/.logs/.bark" ] && echo "ok    ...and they are" || { echo "FAIL  .bark still there"; fails=$((fails + 1)); }
+screen=$(tap '🔔 Turn notifications back on')
+check "ui: turning them back on" "$screen" "🔕 Turn off notifications"
+screen=$(tap '🔕')
+check "ui: Back from notifications" "$(tap '⬅️ Back')" "🔔 Turn on notifications"
 
 dl -p >/dev/null
 out=$(act "🧹 Clear finished")

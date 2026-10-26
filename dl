@@ -10,6 +10,7 @@
 #   dl -a -b <base64>     do what a chosen menu line says (a download line pauses or resumes it)
 #   dl -p | -r | -c       pause all, resume all, clear finished from the list (files stay)
 #   dl -u | -v            update yt-dlp and the other tools now | show their versions
+#   dl <Bark link>        get a notification when a download ends, through the Bark app
 #
 # Finished downloads land in /root/Downloads, or in /mnt/phone when a Files folder is
 # mounted there (see SHARE below).
@@ -23,6 +24,10 @@ SHARE=${DL_SHARE:-/mnt/phone}
 # Where setup-on-phone.sh keeps the signed shortcut, and where updates come from.
 SHORTCUTS=${DL_SHORTCUTS:-/root/Shortcuts}
 UPDATE_URL=${DL_UPDATE_URL:-https://raw.githubusercontent.com/moh-aln/aria2-iphone-shortcut/main/shortcuts/setup-on-phone.sh}
+# Notifications go through the Bark app, because iSH-AOK can't post any itself: dl sends
+# them to Bark's server, which pushes them to the phone. They're off until dl is given a
+# link from Bark, which has the phone's key in it (see bark_link).
+BARK=${DL_BARK:-https://api.day.app}
 LINK_RE='(https?|s?ftp|magnet):[^[:space:]"<>]+'
 SHOWN=10  # downloads in the list, newest first
 # Links to these sites are pages with a video in them. Any other web link is checked
@@ -153,6 +158,7 @@ work() {  # work <id>: the background worker, for as long as the download takes
     deliver "$1"
   fi
   echo "=== exit $code"
+  announce "$1"
   update_if_due
   rest_unless_busy "$1"
 }
@@ -428,11 +434,73 @@ add_links() {
   # so sharing the same video twice is the same download.
   links=$(printf '%s\n' "$1" | grep -oE "$LINK_RE" | sed 's/[.,;:!?]*$//' |
     sed -E '/^https?:\/\/([a-z]+\.)?(youtube\.com|youtu\.be)\//{s/([?&])si=[^&]*&?/\1/; s/[?&]$//;}')
+  # "3️⃣ Then tap here" on the notifications screen sends the clipboard here, expecting a
+  # link from Bark. Anything else on the clipboard then isn't meant to be downloaded.
+  if [ -n "$(find "$JOBS" -maxdepth 1 -name .bark-next -mmin -5 2>/dev/null)" ] &&
+      ! printf '%s\n' "$links" | grep -q "^$BARK/"; then
+    rm -f "$JOBS/.bark-next"
+    echo "There's no Bark link on the clipboard. In Bark, tap the copy button next to one of its links, then tap 3️⃣ again."
+    return 1
+  fi
+  rm -f "$JOBS/.bark-next"
   if [ -z "$links" ]; then
     echo "No link found in: $1"
     return 1
   fi
-  printf '%s\n' "$links" | while IFS= read -r link; do add "$link"; done
+  printf '%s\n' "$links" | while IFS= read -r link; do
+    case $link in "$BARK"/?*) bark_link "$link" ;; *) add "$link" ;; esac
+  done
+}
+
+# Bark shows links like https://api.day.app/<key>/Title/Body, ready to copy. The key is
+# what notifications are sent with. It's kept only once Bark has taken a test with it.
+bark_link() {  # bark_link <link from Bark>
+  key=${1#"$BARK"/}
+  key=${key%%[/?#]*}
+  case $key in '' | *[!A-Za-z0-9]*) echo "That Bark link has no key in it."; return 1 ;; esac
+  if out=$(bark "🔔 aria2 notifications are on" "You'll get one like this when a download finishes. Tap it to open the download." \
+      "$(files_url "$SHARE")" "$BARK/$key" 2>&1); then
+    echo "$BARK/$key" >"$JOBS/.bark"
+    rm -f "$JOBS/.bark.off"
+    echo "Notifications are on. Bark just sent you a test one."
+  else
+    echo "Bark didn't take that link, so notifications are still off. ${out#curl: (*) }"
+    return 1
+  fi
+}
+
+bark() {  # bark <title> <text> [<link it opens when tapped> [<where to send it>]]
+  to=${4:-$(cat "$JOBS/.bark" 2>/dev/null)}
+  [ -n "$to" ] || return 1
+  json="{\"title\": \"$(json_text "$1")\", \"body\": \"$(json_text "$2")\", \"group\": \"aria2\""
+  [ -z "$3" ] || json="$json, \"url\": \"$(json_text "$3")\""
+  # Short enough for the Shortcut's Run Command, which gives up after 20 seconds.
+  timeout 15 curl -fsS -m 12 -o /dev/null -H 'Content-Type: application/json; charset=utf-8' \
+    -d "$json}" "$to"
+}
+
+json_text() { printf %s "$1" | tr -d '\001-\037' | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+# When notifications are on: one when a download finishes, which opens it in the Files app
+# when tapped, and one when it fails. None for a pause.
+announce() {  # announce <id>
+  [ -s "$JOBS/.bark" ] || return 0
+  load "$1"
+  case $state in
+    done)
+      title='✅ Downloaded'
+      what=$(line "$1")
+      what=${what#* }    # the list's line without its ✅
+      what=${what%  #*}  # and without its number
+      url=$(files_url "$path") ;;
+    failed) title='⚠️ Download failed' what="$name${reason:+: $reason}" url= ;;
+    *) return 0 ;;
+  esac
+  # The phone may only just have got its connection back.
+  for try in 1 2 3; do
+    bark "$title" "$what" "$url" 2>/dev/null && return 0
+    sleep 10
+  done
 }
 
 # Stop a download politely: aria2 and yt-dlp keep what they have, and starting the same
@@ -557,6 +625,7 @@ ui() {  # ui <tapped line>
   case $screen in
     list) list_screen ;;
     item\ *) item_screen "${screen#item }" ;;
+    notifications) notifications_screen ;;
     *) main_screen ;;
   esac
 }
@@ -571,6 +640,7 @@ main_screen() {
   echo "➕ Add link from clipboard"
   echo "📂 Open the Downloads folder"
   if [ -d "$JOBS/.updating" ]; then echo "🔧 $(update_progress)"; else echo "🔧 Update tools"; fi
+  if [ -s "$JOBS/.bark" ]; then echo "🔔 Notifications · on"; else echo "🔔 Turn on notifications"; fi
   echo "📲 Open iSH-AOK"
   echo "❌ Close"
 }
@@ -619,6 +689,21 @@ item_screen() {  # item_screen <id>
   esac
 }
 
+notifications_screen() {
+  echo "⬅️ Back"
+  if [ -s "$JOBS/.bark" ]; then
+    echo "✅ On: one when a download finishes. Tap it to open the download."
+    echo "🔔 Send a test notification"
+    echo "🔕 Turn off notifications"
+    return
+  fi
+  [ -s "$JOBS/.bark.off" ] && echo "🔔 Turn notifications back on"
+  echo "ℹ️ Notifications come through Bark, a free app, because iSH-AOK can't send any itself"
+  echo "1️⃣ Install Bark from the App Store, open it and allow its notifications"
+  echo "2️⃣ In Bark, tap the copy button next to one of its links"
+  echo "3️⃣ Then tap here"
+}
+
 tapped() {  # tapped <line>: act on it. Fails after printing an answer the Shortcut acts on.
   case $screen in
     list)
@@ -639,6 +724,19 @@ tapped() {  # tapped <line>: act on it. Fails after printing an answer the Short
         '🗑 '*) load "$id"; forget "$id"; notice "Removed $name from the list."; screen=list ;;
         '▶️ Open') open_or_show "$id" || return 1 ;;
       esac ;;
+    notifications)
+      case $1 in
+        '⬅️ '*) screen=main ;;
+        '3️⃣ '*) : >"$JOBS/.bark-next"; echo @@clipboard; return 1 ;;  # see add_links
+        '🔔 Turn'*) mv "$JOBS/.bark.off" "$JOBS/.bark" 2>/dev/null ;;
+        '🔔 Send'*)
+          if out=$(bark "🔔 Test from aria2" "Tapping this opens your Downloads folder." "$(files_url "$SHARE")" 2>&1); then
+            notice "Sent. If it doesn't arrive, check that Bark may send notifications (Settings → Apps → Bark)."
+          else
+            notice "Bark didn't take it. ${out#curl: (*) }"
+          fi ;;
+        '🔕 '*) mv "$JOBS/.bark" "$JOBS/.bark.off" 2>/dev/null; notice "Notifications are off." ;;
+      esac ;;
     *)
       case $1 in
         '🆕 '*) rm -f "$SHORTCUTS/.pending" ;;
@@ -646,6 +744,7 @@ tapped() {  # tapped <line>: act on it. Fails after printing an answer the Short
         '➕ '*) echo @@clipboard; return 1 ;;
         '📂 '*) files_url "$SHARE" || echo "shareddocuments://"; return 1 ;;
         '🔧 '*) [ -d "$JOBS/.updating" ] || update_in_background >/dev/null ;;
+        '🔔 '*) screen=notifications ;;
         '📲 '*) echo @@app; return 1 ;;
         '❌ '*) echo @@exit; return 1 ;;
       esac ;;
@@ -765,6 +864,6 @@ case $1 in
   -p | -x) pause_all ;;
   -r) resume_all ;;
   -c) clear_finished ;;
-  '' | -h | --help) sed -n '2,15p' "$0" ;;
+  '' | -h | --help) sed -n '2,16p' "$0" ;;
   *) add_links "$*" ;;
 esac
