@@ -169,6 +169,7 @@ def icons():
     """{name: PNG bytes} for every picture the menus use."""
     found = {
         "back": symbol(GRAY, line(0.12, -0.36, -0.22, 0, 0.16), line(-0.22, 0, 0.12, 0.36, 0.16)),
+        "more": symbol(GRAY, line(-0.12, -0.36, 0.22, 0, 0.16), line(0.22, 0, -0.12, 0.36, 0.16)),
         "downloads": symbol(BLUE, *arrow_down(-0.46, 0.22), line(-0.42, 0.44, 0.42, 0.44, 0.13)),
         "add": symbol(GREEN, line(0, -0.42, 0, 0.42, 0.16), line(-0.42, 0, 0.42, 0, 0.16)),
         "folder": symbol(TEAL, *FOLDER),

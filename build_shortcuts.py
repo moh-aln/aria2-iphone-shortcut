@@ -274,7 +274,7 @@ mkdir -p /root/Downloads/.logs
 echo "iSH-AOK will ask for location access: allow it. It keeps this setup going if you leave"
 echo "the app, and later keeps downloads going in the background."
 awake=
-if ! pgrep -f 'dd if=/dev/location' >/dev/null; then
+if ! pgrep -f 'dd if[= ]/dev/location' >/dev/null; then  # BusyBox dd rewrites its arguments
   nohup dd if=/dev/location of=/dev/null bs=64 >/dev/null 2>&1 </dev/null &
   awake=$!
 fi

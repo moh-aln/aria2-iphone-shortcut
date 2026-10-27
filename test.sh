@@ -85,6 +85,10 @@ for f in "$here"/icons/*.png; do name=${f##*/}; base64 -w 0 "$f" >"$DL_ICONS/${n
 printf '#!/bin/sh\nexec %s --max-overall-download-limit=50K "$@"\n' "$(command -v aria2c)" >"$tmp/bin/aria2c"
 printf '#!/bin/sh\nexec %s --limit-rate 25K "$@"\n' "$(command -v yt-dlp)" >"$tmp/bin/yt-dlp"
 chmod +x "$tmp/bin/aria2c" "$tmp/bin/yt-dlp"
+# A stand-in for /dev/location: a pipe nobody writes to blocks its reader, as the device
+# does until the next update. And the system's touch, to make a log look old.
+mkfifo "$tmp/location"
+systouch=$(command -v touch)
 PATH=$tmp/bin
 
 fails=0
@@ -471,6 +475,56 @@ case $out in *GOODKEY42* | *"$token"*) fail "the report gave away a secret" ;; *
 check "...then says so" "$(u3 '')" "N;CHARSET=utf-8:Copied a debug report;;;;"
 check "the live view shows the report, ready to copy" "$(web "/report/$gid?t=$token")" "Copy the report</button>"
 check "...the same report" "$(web "/report/$gid?t=$token")" "== Download #$gid: failed"
+
+# A long screen of vCards comes in pages: iOS lets a shortcut hand at most 10 contacts at
+# a time to iSH-AOK, unless the phone allows "large amounts of data".
+for i in 70 71 72 73 74 75 76 77 78 79; do
+  printf 'https://example.com/page-%s.zip\n=== start\n=== via aria2\n' $i >"$DL_DIR/.logs/$i.log"  # paused
+done
+u3 @@start >/dev/null
+cards=$(u3 Downloads)
+[ "$(printf '%s\n' "$cards" | grep -c '^BEGIN:VCARD$')" -le 10 ] && ok "cards: a long list comes in pages of at most 10 rows" ||
+  fail "cards: $(printf '%s\n' "$cards" | grep -c '^BEGIN:VCARD$') rows on one screen"
+check "...with More at the bottom" "$cards" "N;CHARSET=utf-8:More;;;;"
+cards=$(u3 More)
+check "...which shows the next page" "$cards" "N;CHARSET=utf-8:Previous;;;;"
+[ "$(printf '%s\n' "$cards" | grep -c '^BEGIN:VCARD$')" -le 10 ] && ok "...of at most 10 rows too" || fail "page 2 is too long"
+check "...and Previous goes back" "$(u3 Previous)" "N;CHARSET=utf-8:Back;;;;"
+[ "$(ui '' | wc -l)" -gt 10 ] && ok "plain lines aren't paged: they're text, not contacts" || fail "plain lines were paged"
+for i in 70 71 72 73 74 75 76 77 78 79; do rm -f "$DL_DIR/.logs/$i.log"; done
+
+# A download that prints nothing for 5 minutes was frozen with iSH-AOK: it starts again.
+printf 'resumed\n' >"$tmp/www/stall.txt"
+nohup sh -c 'sleep 900' sh --work 80 >/dev/null 2>&1 &
+echo $! >"$DL_DIR/.logs/80.pid"
+printf 'http://127.0.0.1:%s/stall.txt\n=== start\n=== via aria2\n[#e5d549 4KiB/1.6MiB(1%%) CN:1 DL:0B]\n' "$port" \
+  >"$DL_DIR/.logs/80.log"
+"$systouch" -d '10 minutes ago' "$DL_DIR/.logs/80.log"
+u3 @@start >/dev/null
+check "a download quiet for 5 minutes is started again" "$(log_of 80)" "=== stalled: nothing for 5 minutes, so it starts again"
+for try in $(seq 20); do line_for stall.txt | grep -q ✅ && break; sleep 1; done
+check "...and carries on" "$(line_for stall.txt)" "✅ stall.txt"
+
+# While something downloads, a loop keeps reading the location (and so iSH-AOK running).
+# BusyBox dd rewrites its arguments, so its command line reads "dd if <file>".
+export DL_LOCATION="$tmp/location"
+reader="dd if[= ]$tmp/location"
+dl "http://127.0.0.1:$port/rabbit2.mp4?awake" >/dev/null
+for try in $(seq 10); do pgrep -f "$reader" >/dev/null && break; sleep 1; done
+pgrep -f '^sh [^ ]*dl --awake-loop$' >/dev/null && ok "a download starts the loop that keeps iSH-AOK awake" ||
+  fail "no awake loop while downloading"
+[ "$(pgrep -f "$reader" | wc -l)" = 1 ] && ok "...which reads the location, once" || fail "readers: $(pgrep -f "$reader" | wc -l)"
+dl "http://127.0.0.1:$port/rabbit3.mp4?awake" >/dev/null
+sleep 2
+loops() {  # one process group each: the loop's own forks (for sleep, say) are in its group
+  for p in $(pgrep -f '^sh [^ ]*dl --awake-loop$'); do cut -d' ' -f5 "/proc/$p/stat" 2>/dev/null; done | sort -u | wc -l
+}
+[ "$(loops)" = 1 ] && ok "...one loop however many downloads" || fail "$(loops) awake loops"
+dl -p >/dev/null
+for try in $(seq 15); do [ "$(loops)" = 0 ] && break; sleep 1; done
+[ "$(loops)" = 0 ] && ok "...and stops when nothing downloads" || fail "the awake loop kept going with nothing downloading"
+pgrep -f "$reader" >/dev/null && fail "something still reads the location" || ok "...reader and all"
+unset DL_LOCATION
 
 # formats.py: a video's qualities, from what yt-dlp -J prints (here, a made-up YouTube-like one).
 rows=$(python3 "$DL_FORMATS" "$here/test-data/youtube-like.json" | tr '\037' '|')

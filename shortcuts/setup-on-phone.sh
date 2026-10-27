@@ -16,7 +16,7 @@ mkdir -p /root/Downloads/.logs
 echo "iSH-AOK will ask for location access: allow it. It keeps this setup going if you leave"
 echo "the app, and later keeps downloads going in the background."
 awake=
-if ! pgrep -f 'dd if=/dev/location' >/dev/null; then
+if ! pgrep -f 'dd if[= ]/dev/location' >/dev/null; then  # BusyBox dd rewrites its arguments
   nohup dd if=/dev/location of=/dev/null bs=64 >/dev/null 2>&1 </dev/null &
   awake=$!
 fi
@@ -145,19 +145,77 @@ start() {  # start <link> <id>
 }
 
 # iOS pauses iSH-AOK soon after it leaves the screen, unless iSH-AOK is getting location
-# updates (with location access set to Always). So read /dev/location while anything is
-# downloading, and stop once nothing is, to save battery.
+# updates (with location access set to Always). So while anything is downloading, a loop
+# (dl --awake-loop) reads /dev/location, and it stops once nothing is, to save battery.
+LOCATION=${DL_LOCATION:-/dev/location}
+
 keep_awake() {
-  [ -e /dev/location ] || return 0
-  pgrep -f 'dd if=/dev/location' >/dev/null && return 0
-  nohup dd if=/dev/location of=/dev/null bs=64 >/dev/null 2>&1 </dev/null &
+  [ -e "$LOCATION" ] || return 0
+  awake && return 0
+  $(command -v setsid) nohup sh "$0" --awake-loop >/dev/null 2>&1 </dev/null &
+  echo $! >"$JOBS/.awake.pid"
+}
+
+awake() {  # is the loop running?
+  pid=$(cat "$JOBS/.awake.pid" 2>/dev/null)
+  [ -n "$pid" ] && tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q -- '--awake-loop'
+}
+
+# BusyBox dd rewrites its own arguments as it reads them ("if=/dev/location" becomes
+# "if /dev/location" in /proc/<pid>/cmdline), so it's found with either.
+READER="dd if[= ]$LOCATION"
+
+# iSH-AOK runs location updates while /dev/location is open, and stops them when the last
+# reader closes it. iOS pauses them by itself when the phone sits still, and then
+# suspends the app: on the user's phone, a YouTube download froze for 40 minutes. So the
+# reading starts afresh every minute (which starts the updates again), and at once if
+# the reader dies. Readers left by older versions of dl go first, or the device would
+# never close.
+awake_loop() {
+  pkill -f "$READER" 2>/dev/null
+  while :; do
+    dd if="$LOCATION" of=/dev/null bs=64 2>/dev/null &
+    reader=$!
+    waited=0
+    while [ $waited -lt 60 ] && kill -0 $reader 2>/dev/null; do
+      sleep 5
+      waited=$((waited + 5))
+      # Two downloads starting at once can start two loops: the one not in .awake.pid goes.
+      [ "$(cat "$JOBS/.awake.pid" 2>/dev/null)" = $$ ] || { kill $reader 2>/dev/null; exit 0; }
+    done
+    kill $reader 2>/dev/null
+    wait $reader 2>/dev/null
+    sleep 1  # closed for a moment, so that the next open starts the updates afresh
+  done
 }
 
 rest_unless_busy() {  # rest_unless_busy <id of the download that's ending>
   for id in $(ids); do
     [ "$id" != "$1" ] && running "$id" && return 0
   done
-  pkill -f 'dd if=/dev/location' 2>/dev/null
+  # The loop has a process group of its own (setsid), with its reader in it.
+  if awake; then kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null; fi
+  rm -f "$JOBS/.awake.pid"
+  pkill -f "$READER" 2>/dev/null
+}
+
+# A download that has printed nothing for 5 minutes was frozen with iSH-AOK: its network
+# connections broke while iOS had the app suspended, and it won't carry on by itself
+# (the user's YouTube download sat at "Downloading m3u8 information"). Start it again,
+# which carries on from where it was. Not while it merges, converts or moves its file,
+# which can be quiet for longer.
+revive() {
+  for id in $(ids); do
+    running "$id" || continue
+    [ -n "$(find "$JOBS" -maxdepth 1 -name "$id.log" -mmin +5 2>/dev/null)" ] || continue
+    case $(tail -n 1 "$JOBS/$id.log") in
+      '[Merger]'* | '[ExtractAudio]'* | '[Fixup'* | '[VideoRemuxer]'* | '[VideoConvertor]'* | \
+        'Deleting original'* | '=== moving to Files'*) continue ;;
+    esac
+    echo "=== stalled: nothing for 5 minutes, so it starts again" >>"$JOBS/$id.log"
+    pause "$id"
+    start "$(head -n 1 "$JOBS/$id.log")" "$id"
+  done
 }
 
 fetch_file() {
@@ -277,6 +335,12 @@ work() {  # work <id>: the background worker, for as long as the download takes
     deliver "$1"
   fi
   echo "=== exit $code"
+  # Paused (or stopped): nothing else to do, and the sooner the worker is gone, the sooner
+  # iSH-AOK can stop keeping itself awake.
+  if segment "$1" | grep -q '^=== paused'; then
+    rest_unless_busy "$1"
+    return
+  fi
   announce "$1"
   # A failure leaves a debug report in Files, ready to send to whoever helps.
   load "$1"
@@ -942,6 +1006,10 @@ ui() {  # ui <what was tapped>
   LEVEL=0
   [ -n "$SHORTCUT" ] && LEVEL=2
   case $SHORTCUT in [0-9]*-*) LEVEL=${SHORTCUT%%-*} ;; esac
+  # The page of the screen on show (see render): the same screen keeps its page.
+  pageno=1
+  [ "$(sed -n 1p "$JOBS/.page" 2>/dev/null)" = "$screen" ] && pageno=$(sed -n 2p "$JOBS/.page")
+  before=$screen
   case $1 in
     @@start) screen=main; opening || return 0 ;;
     @@add:*) incoming "${1#@@add:}" share || return 0 ;;    # shared to the Shortcut
@@ -949,8 +1017,14 @@ ui() {  # ui <what was tapped>
     '') ;;
     *) tapped "$(row_key "$1")" || return 0 ;;
   esac
+  # Another screen starts at its first page, and so does one with a message on it, which
+  # comes first.
+  [ "$screen" = "$before" ] || pageno=1
+  [ -s "$JOBS/.notice" ] && pageno=1
+  printf '%s\n%s\n' "$screen" "$pageno" >"$JOBS/.page"
   cards=  # pictures, unless they're off or the shortcut can't show them
   [ -n "$SHORTCUT" ] && [ ! -e "$JOBS/.plain" ] && cards=1
+  case $screen in main | list | item\ *) revive ;; esac  # see revive
   echo "$screen" >"$JOBS/.screen"
   rows=$JOBS/.rows.$$
   : >"$rows"
@@ -984,14 +1058,14 @@ notice() { printf '%s\n%s\n' "$1" "$2" >"$JOBS/.notice"; }  # notice <title> [<d
 # Prints the rows as vCards or lines, and keeps what each showed in .menu. Rows have to
 # read differently from each other, because what was tapped is all that comes back.
 render() {
-  awk -F '\037' -v cards="$cards" -v icons="$ICONS" -v menu="$JOBS/.menu" '
+  awk -F '\037' -v cards="$cards" -v icons="$ICONS" -v menu="$JOBS/.menu" -v page="$pageno" '
     BEGIN {
       # The picture for each emoji, unless the row names one.
       n = split("⬅️ back 📥 downloads ⬇️ downloads ➕ add 📂 folder 📦 folder ⚙️ settings 🆕 new " \
         "🔔 bell 🔕 belloff ⬆️ update 🔧 tools 📲 app ⏸ pause ▶️ play ⏹ stop 🔁 retry " \
         "🔄 refresh 🗑 trash ℹ️ info ✅ done ⚠️ failed 🧹 clear 🖼 pictures ⏳ prep0 " \
         "1️⃣ appstore 2️⃣ copy 3️⃣ paste 📊 live 📤 share 🔗 copy ➖ remove 🐞 bug " \
-        "🎬 video 🎵 music ⚡ bolt 🎚 sliders 🔇 mute ⚪ unchecked 📃 playlist", w, " ")
+        "🎬 video 🎵 music ⚡ bolt 🎚 sliders 🔇 mute ⚪ unchecked 📃 playlist ➡️ more", w, " ")
       for (i = 1; i < n; i += 2) pic[w[i]] = w[i + 1]
       printf "" > menu
     }
@@ -1020,8 +1094,7 @@ render() {
       close(f)
       return data
     }
-    {
-      key = $1; emoji = $2; title = $3; detail = $4; p = $5
+    function show(key, emoji, title, detail, p,   k, t, shown, data) {
       gsub(/[[:cntrl:]]/, " ", title); gsub(/[[:cntrl:]]/, " ", detail)
       title = cut(title, cards ? 38 : 30); detail = cut(detail, cards ? 60 : 40)
       for (k = 1; ; k++) {
@@ -1031,14 +1104,31 @@ render() {
       }
       seen[shown] = 1
       print key "\t" shown > menu
-      if (!cards) { print shown; next }
+      if (!cards) { print shown; return }
       print "BEGIN:VCARD\nVERSION:3.0\nN;CHARSET=utf-8:" esc(t) ";;;;"
       if (detail != "") print "ORG;CHARSET=utf-8:" esc(detail) ";"
       data = photo(p == "" ? pic[emoji] : p)
       if (data != "") print "PHOTO;ENCODING=b:" data
       print "END:VCARD"
     }
-    END { close(menu) }'
+    { rows++; K[rows] = $1; E[rows] = $2; T[rows] = $3; D[rows] = $4; P[rows] = $5 }
+    END {
+      # iOS lets a shortcut hand at most 10 contacts at a time to another app, unless
+      # Settings → Shortcuts → Advanced → Allow Sharing Large Amounts of Data is on; a tap
+      # on an 11-row screen of vCards showed "This action is trying to share 11 Contacts
+      # items, which is not allowed". So a longer screen comes in pages of 8 rows, with
+      # Previous and More: at most 10. Plain lines are text, so they have no limit.
+      from = 1; to = rows
+      if (cards && rows > 10) {
+        pages = int((rows + 7) / 8)
+        page = page < 1 ? 1 : (page > pages ? pages : page)
+        from = (page - 1) * 8 + 1; to = from + 7 < rows ? from + 7 : rows
+        if (page > 1) show("less", "⬅️", "Previous", "Page " page - 1 " of " pages, "")
+      }
+      for (i = from; i <= to; i++) show(K[i], E[i], T[i], D[i], P[i])
+      if (cards && rows > 10 && page < pages) show("more", "➡️", "More", "Page " page + 1 " of " pages, "")
+      close(menu)
+    }'
 }
 
 row_key() {  # row_key <what was tapped>: the key of the row that showed it
@@ -1055,6 +1145,8 @@ tapped() {  # tapped <key>: act on the row tapped. Fails after printing an answe
   id=${screen#* }  # on the screen of one download: "item <id>" or "confirm <id>"
   case $1 in
     '' | notice | self) ;;  # just show the screen again
+    more) pageno=$((pageno + 1)) ;;  # pages of a long screen (see render)
+    less) pageno=$((pageno - 1)) ;;
     back:*) screen=${1#back:} ;;
     downloads) screen=list ;;
     add) echo @@clipboard; return 1 ;;
@@ -1614,8 +1706,13 @@ report() {
   echo "Tools:$tools"
   echo "Free space: $(df -h "$DEST" 2>/dev/null | awk 'NR == 2 { print $4 }') · Files folder: $(share_ready && share_host || echo 'none mounted')"
   awake=no
-  pgrep -f 'dd if=/dev/location' >/dev/null && awake=yes
-  echo "Keeping iSH-AOK awake: $awake · /dev/location: $([ -e /dev/location ] && echo yes || echo no)"
+  awake && awake="yes, $(pgrep -f "$READER" | wc -l) reader(s)"
+  # Whether location updates reach iSH-AOK at all (they need location access Always);
+  # the place itself isn't put in the report.
+  updates="no update within 5 s (is iSH-AOK's location access Always?)"
+  [ -e "$LOCATION" ] || updates="no $LOCATION"
+  [ -e "$LOCATION" ] && timeout 5 head -c 1 "$LOCATION" >/dev/null 2>&1 && updates=arriving
+  echo "Keeping iSH-AOK awake: $awake · location updates: $updates"
   echo "Settings: notifications $(on_off "$JOBS/.bark") · automatic updates $(auto_updates && echo on || echo off) · pictures $(on_off_flag "$JOBS/.plain")"
   echo
   echo "== The list"
@@ -1827,7 +1924,8 @@ case $1 in
   --work) work "$2" ;;
   --thumb) thumb "$2" "$3" ;;
   --act) web_act "$2" "$3" ;;      # the live view's buttons (web.py)
-  --awake) keep_awake ;;           # while the live view is open
+  --awake) keep_awake; revive ;;   # while the live view is open
+  --awake-loop) awake_loop ;;      # see keep_awake
   --rest) rest_unless_busy ;;      # when it closes
   --report) report "$2" ;;         # a debug report (see report)
   --probe) probe ;;                # the qualities of a video (see choose)
@@ -1856,6 +1954,7 @@ while read -r icon data; do
   printf '%s' "$data" >"/usr/local/share/dl/icons/$icon.b64"
 done <<'ICONS'
 back iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAACw0lEQVR42u2dMU7DQBBFfRAfxBfxQXwRN3Rp6N2m4AapkKgjOksRfTiAyaJNcIRJ7OBk/njfSlMRIHrfnpndnZ3NMuFR109ltKZn3RXrf/b79zPGJOABXDsC9FRrj6JA+gd4frDqYJs7AL9mm/i/8xTBFyPdyaMsfJciBfDVndzLnG6qAjxCzOpqPIEfEqLwCD4X8/FzxIjcC/zS+VN/6W0o1eE3CwT/621QdTltAvD7b0OOy0ndJUX4XeJWAj81EYBvKALwDUUAvqEICaaaWikq8KeJwAx3KTNm/L5hPMDvG8cDXI+hK4qbKQCcxwqyHk9ZUdzDBdy8VvH0e3gLPD/96/VLt99/dsex2310q9Wzr7fA69Mf4A+NIIibt8Br5vMX/OMIP3eREXnM+6/BD2O7fdefF8RZ7+Lgh/H6+qb23XP3wXcs/DDEAvFwMDYqEb/JAtB+tuPI/59K44cEAP4DzeWS8xT4YoH38lK1h+xnYfDPsyH1ydcC4Z9PyoBvGAfU/X+AukT4pzigLMDC4Z8EaDzDD+5JcKI1PhArCpAIfE0BEoJ/EgD4lpmQt8W1JcGXESAATRG+jABjn37lxTUEQABcEEEYAUhDbxGAiRgzYZYiWIwzFIDlaPYDEt6QYUtSoDSFTXn7TXnKUozLUijMsj5DTGmiYWkixbkaxbmUpxuXp3NAw/KABkeUBFoXcEhPoG0Bx1SND2tzUFugXQGtCowbdtCsw7hZB2+BcbsaGjYJNGyiZZlxyzKa9s3jeur/NnGtaVs535Iz3ROduB6yIoOsh3gg5PeJBwJ+HxEE4SOCAHxEEICPCALwuchN6G7JmqsMuczT7QwXl+TQ5XChs5+btbnSXESIypkQ7eQ9XIQA/FTX1Ij5+CJLbcRgXRmVxm/i/84zxlkK29zJTbXxb5eQnibIUZRmpNvqf7ZUB/4FxQSe2yuog7gAAAAASUVORK5CYII=
+more iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAACvklEQVR42u2dP07DMBTGc5AcJBfJQXKRLGxd2L124AaZkJgrtkgVezlAaFAqgghtLFLe9+yfJW+BRt8v/vzn2c9FIVza9qGeapjV4UadP/v59wUlSvBRuH6F0LG1v0BB6S/By3NtzrW7g+C3ajf9dpmj8NVKO/mvOr5LlYPwzZ3sZUubahAeEJtajSfhl0BUHoUvxTx+iz6i9CJ+7fyrv9YaanXxQ4LC/2gNqpbTZyD+vDWUWE7uljSJP2Rea8TPDQLiG0JAfEMIiG8IIcOhptYQFfHjIDDDTWXGjO8b9gf4vnF/gPUYWtEUTEHAbWrFqMfTqGiK4SLctrXh6/fQCpS+/t3ucTge34ZLOZ3eh/3+Ke1WoPT1j4IvFccQejcjn1Hka8UxhMrFuP9weB1uFacQwrVZr8yLPj+/DGuKUwil/NBz7IDXFocQmiUAndqL3uoH5qOjEZgjAN0SAMmXTRWCqyXnNR2yQwi1q1XPBCEEd0sPiUHo5f0/dQhuQ45rIYzPyfcDXmO+iUCo3YYdR3v5bbHOEYTgOu6bAITgPvDuHEIoPIufAoQkAMRCUFq8SwZALASVOUJSAGIW71RaAQAAgAXRCQMg72EoEzFmwixFIL4hAJajiQdkHJAhJCmwNYWgvH1Qnm0pxttS2JhlfYaYrYmGWxPZnKuxOZft6cbb0zmgYXlAgyNKAqkLOKQnkLaAY6rGh7U5qC2QroBUBcYJO0jWYZysg1ZgnK6GhE0CCZtIWWacsoykfdtYT/vXJK4taSu3W3Ime6IT62FUZDDqoT8Q8n36AwHfB4Kg+EAQEB8IAuIDQUB8LnITuluy5SpDLvN0O8PFkhxaDhc6+7lZmyvNRUA0zkD00TFcQCB8rDUFMY+vitzK1Fk3Rlvju+m3y4LybQgb7mRT/fS/a5SOA3KBElba1vzZWl3wD6S8nttR8TQeAAAAAElFTkSuQmCC
 downloads iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAADDElEQVR42u2dzVHkMBCFfSYGXzcHH0nCJ6JwDiQACXBXFWm4iGADMBFsBAKBB2ZgGNus5H6v9VTVVVPz63mf1WpJLalpgMvVbexnC0cWF+z4vW+fb1Q2CZ6Em1YIvdWmAxQp/Sl4+2rDq40FBF+ycf7ttkbhu5XuZC9L19LVIPxQyL3kdFODhBeIrK6GSfhzIDpG4VswH5+jjWhZxO/J7/pLtaFHFz84FP5bbUB1OVMF4h/XhlYup3aXNIsfK7de4tcGQeIbQpD4hhAkviGECkNNrBBV4m+DoB6ulx6z/L5heyC/b9weoLqeP3cx3j/F+Pzv3dLj9JwrVzRPpkCKn0T/WtJzwBA6N1FPutt/Kuk1F1HRPIcL+Weenn8GkF4Dbg8GFzH/UqHvGyDf/eQA1tUC9LCTHMBEGfk4AnA5ImIYcnAAIFzq9UYB2MVausbXGYDhHIBRAPZLjT8HIArAfkY75OwFwMlQNdOEiyMAgXK60RGAic7/OwMQKaccPQF4awcEwB5AEADDhlgABKB6AFEADCMhARCAxZSTXAUxdQWuBpSCgJo3BOmCckNATtqCbQNyQQDPmMNuhP8XArr4FFHQbyEwiH8AELxBYBGfqie8FgKR+HxDEUsQyMT/AEA1HE26PsDPfMA5CKTif07MM66/OkAgFj/SrwFOwrOK/3VSXuuAjdNStBbYeg2xBDFMTWRKznViI216uhMbaBdoOLFWu6Igbl1QapFeitUf/0aakq61YP+i232Z6qXV7ail0Kr7afeF2tcPkbakazfZriBnLbh55AWQrt1kw47ctaBkrk/JHCKzzTpK1AImCOlaze7+khFR8qnpjyFbAb//uw2b1C8w3rJMm/YBbNqnoerMQ87auJXE9WjrYoOoR+0BkN9XewDg9wUBUHxBABBfEADEFwQA8XWQG9DZklc6ylCHedL2cOWSCF2ODnTmOVlbR5qDgBjIQEyb53AFQsJvdU0BzMd3TW1lbqwHo9T4cf7ttlE5CWFDITc1zd/dS+ltQA5Qwkq3dfzeHl3wF+SCPe8L6OCDAAAAAElFTkSuQmCC
 add iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAACuElEQVR42u2dsU7DMBCG8yB5iI55A54gEs/A5mdi88zEA4S5CxJrJoSQWFiYTI1SkUKaNlLiu7O/k05CLdDo/5o7O2efq0qx7fa37eB+5OGCj3/35+8rbJHgUbj+CqGXen+EgtK/gtcHdwfvNhD8knfDZ9clCt9cGU5SebyWpgTh3UbhZc0w5RAeEKuGGkvCT4FoLApfK4vxa+SI2or4rfFv/dzd0GoX32co/L+7QWvI6QsQf3w31ISc0kPSIH4o3FvELw0C4gtCQHxBCIgvCKHAoaauISriL4PADDeXGTNxXzAfEPeF8wGhRzAUDcUUBFzHm6xGPTfPd+Hx4ykcLf4cX8tmVDTUcNWK//r1Hv5afE05BJfFt//+7SGcs/ie+btA87c/+v7z5SyA+J7yXODMz3gvmekZsoWRj3EA8yMiC+P+DAD4uVlvAEASr80l38wAuCkAHQDSLY2fAhAAkM7NPnLOBcDJo2pLTz0zAuBNlhszAtCbi/+ZAQgmS445AfjJAwCQB+ABIJiIAQCA4gEkKSPGatVcMUWLxWuM15qqvFmlEH+qhqvdUtWYNwcwXr1gzeK1mwdg3QAAAEIQSZgkzDB0SwBMxJgJAwAAggB4HE09oGAAlCQVLE2hKC9flGdZivCyFBZmSe8hBoDg0kQW5+pYnMvydOHl6WzQkNygwRYlBa0L2KSnoG0B21SFN2uzUVtBuwJaFQg37KBZh3CzDtrVKGjiR8Mm4YZNtCxT0D1xR9M+2aZ9tK1c+ZEz3RONhB5aFwuMesgHiuI++UBB3AeCQvGBoEB8ICgQHwgKxOcgN0VnS+44ypDDPM3OcAlJBkMOBzrbOVmbI82VgHDGQPSLa7iAQPilockri/FNVZoNydoJLY3vhs+uK+xkCOs3ClP98L9blF4G5AjFXxm2xr/bahf8G2pmNDqEtqqlAAAAAElFTkSuQmCC
 folder iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAACvUlEQVR42u2dsU7DMBCG8yB5CMa8AU+QlXfIwFvwJJkYERtLkZAYUCcmpIiBARYGxGbqyhVBFJqAnbuzv5Nua5v0/+LzObbPVaXYjs6v2+D9yN0BH392+/0KmyW4F26YIPRcH3ZQUPpT8Hrj3cZXCQQ/5Ktw7bpE4ZuJ4WQp9/fSlCB8lyi8xAxTHcIDImqosST8PhCNReFrZTE+Rh9RWxG/Nf7U/9YaWu3i9xkK/601aA05QwHij1tDTcgpPSQF8V3h3iJ+aRAQXxAC4gtCQHxBCAWmmrpSVMSfB4ERbi4jZuK+YH9A3BfuDwg9gqEoTKYgYBxvyHosZUVhDhfh4nrH02+hFfD0C7eCFE//ydXand7c/9n994toBbEzn+OLW3f38upi2NPb+/b3ss6IYuf9l4/PLqZ5CNmOC8KoN+rFUlgmoahepPMFwIzOOMUScQD8vDR+HwBnAcB/silNmdcir5ytm08iFnlVneqtZw52tn5Inw2levWQgyVMfYek8T8XACk7/uRTjgCY0A8AQB5ADwAxAD0AAAAABwC51x8AAAAAAAAAAAAAAAAAgBAABmKMhAEAAEEAvI5mPqBgAExJCk9JMikvBmBgWYosgJ6FWbIAWpNLE3MBYHZxbiYAVmaXp2cCoDO7QSMTAPUiW5Ri7Q+TNP8fFitdEHuTnl9jb90S7BNoFt2m6jc7+BXG1szfs7/3xTdrs1FbQbkCShUIF+ygFQgX66AVKCjiR8Em4YJNlCxTUD2Ron0KirhStlJBGWNCkYKjTghFgqWL6Q+UnC9Df8AZApyiAQTOkUF8ICgQn4PcFJ0tecRRhhzmaXaES0gyGHI40NnOydocaa4ERGcMxDB7DhcQCD83NPXKYnxTlWahs+5SLI2fskQ8XLuusC8pbJ8oTA3ht1uUngdkB6WfGLbGn221C/4BqT7vVGF9WYYAAAAASUVORK5CYII=

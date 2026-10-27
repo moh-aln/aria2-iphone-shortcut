@@ -43,7 +43,8 @@ Both run in Alpine Linux inside the [iSH-AOK](https://github.com/emkey1/ish-AOK)
    ```
    This installs aria2, yt-dlp, Node, QuickJS, ffmpeg and `dl`, about 150 MB the first time. It also asks for location access. Finally, it sends the shortcut to RoutineHub's HubSign service to be signed, because iOS only imports signed shortcuts. The shortcut holds nothing private: it contains commands like `dl -ui` and iSH-AOK's app ID.
 5. Import the shortcut: in Files, open the folder from step 3, tap **aria2.shortcut** and add it. It's always that name there; each new version replaces the one before.
-6. Settings → Apps → **iSH-AOK** → **Location**: choose **Always**, and turn **Precise Location** off. iOS keeps iSH-AOK running in the background only while it gets location updates. `dl` asks for them while something is downloading and stops when nothing is. Without Always, downloads only move while iSH-AOK is open.
+6. Settings → Apps → **iSH-AOK** → **Location**: choose **Always**. iOS keeps iSH-AOK running in the background only while it gets location updates. `dl` asks for them while something is downloading and stops when nothing is. Without Always, downloads only move while iSH-AOK is open.
+7. Settings → Apps → **Shortcuts** → **Advanced** → turn on **Allow Sharing Large Amounts of Data**. The menus' rows are contact cards, and without this, iOS stops a shortcut from handing more than 10 of them to iSH-AOK ("This action is trying to share 11 Contacts items, which is not allowed"). aria2 splits longer screens into pages of 10 anyway, with **More** and **Previous**.
 
 ## Using the "aria2" shortcut
 
@@ -180,7 +181,7 @@ From this folder: `sh test.sh`
 
 - **Choosing the quality waits** while aria2 asks the site, up to 80 seconds, with the shortcut showing that it's running. If it isn't done by then, tap **⏳ Still finding the qualities…** to wait some more.
 - **YouTube is slow to start.** Every YouTube video's download address is scrambled, and only YouTube's own player JavaScript (several MB, deliberately obfuscated) can unscramble it. yt-dlp runs that for every video inside iSH-AOK's Linux emulation, which shows as "Solving JS challenges". With Node it takes about 40 seconds on an iPhone; with QuickJS, about 2½ minutes. Each video in a playlist pays it again.
-- **Background:** iOS may still pause location updates when the phone sits still for a long time, and then the download waits until iSH-AOK is opened. A single Run Command can last 120 seconds at most, which is why `dl` starts every download in the background and returns at once.
+- **Background:** iOS pauses location updates by itself when the phone sits still, and then freezes iSH-AOK, which breaks its downloads' connections. So `dl` closes and reopens the location every minute, which starts the updates again. And a download that has printed nothing for 5 minutes is started again (it carries on where it was) whenever you open aria2 or the live view. A single Run Command can last 120 seconds at most, which is why `dl` starts every download in the background and returns at once.
 - **Instagram** often refuses downloads without a login, and Instagram stories always need one. yt-dlp can use cookies from a logged-in browser, but `dl` doesn't pass any yet.
 - **Torrents** stop as soon as they finish (no seeding). If a torrent gets no data for 15 minutes, it gives up; tap it in the list to try again.
 - **`.torrent` files** shared as files (rather than as links) aren't handled yet. Magnet links and links to `.torrent` files work.
