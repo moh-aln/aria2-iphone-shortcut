@@ -1,0 +1,16 @@
+{
+  "id": "1850000000000000000",
+  "title": "محمد ( تقني ) - 📌متداول: مقطع لحظة غضب بسبب عدم السماح له بالدوران",
+  "thumbnail": "https://pbs.twimg.com/amplify_video_thumb/1/img/a.jpg",
+  "formats": [
+    {"format_id": "hls-audio-32000-Audio", "ext": "mp4", "vcodec": "none", "acodec": "mp4a.40.5", "tbr": 32, "protocol": "m3u8_native", "url": "https://video.twimg.com/a32.m3u8"},
+    {"format_id": "hls-audio-64000-Audio", "ext": "mp4", "vcodec": "none", "acodec": "mp4a.40.5", "tbr": 64, "protocol": "m3u8_native", "url": "https://video.twimg.com/a64.m3u8"},
+    {"format_id": "hls-audio-128000-Audio", "ext": "mp4", "vcodec": "none", "acodec": "mp4a.40.2", "tbr": 128, "protocol": "m3u8_native", "url": "https://video.twimg.com/a128.m3u8"},
+    {"format_id": "hls-256", "ext": "mp4", "vcodec": "avc1.4D401E", "acodec": "none", "width": 480, "height": 270, "tbr": 256, "protocol": "m3u8_native", "url": "https://video.twimg.com/v256.m3u8"},
+    {"format_id": "http-256", "ext": "mp4", "width": 480, "height": 270, "tbr": 256, "protocol": "https", "url": "https://video.twimg.com/v256.mp4"},
+    {"format_id": "hls-832", "ext": "mp4", "vcodec": "avc1.4D401F", "acodec": "none", "width": 1280, "height": 720, "tbr": 832, "protocol": "m3u8_native", "url": "https://video.twimg.com/v832.m3u8"},
+    {"format_id": "http-832", "ext": "mp4", "width": 1280, "height": 720, "tbr": 832, "protocol": "https", "url": "https://video.twimg.com/v832.mp4"},
+    {"format_id": "hls-2176", "ext": "mp4", "vcodec": "avc1.640028", "acodec": "none", "width": 1920, "height": 1080, "tbr": 2176, "protocol": "m3u8_native", "url": "https://video.twimg.com/v2176.m3u8"},
+    {"format_id": "http-2176", "ext": "mp4", "width": 1920, "height": 1080, "tbr": 2176, "protocol": "https", "url": "https://video.twimg.com/v2176.mp4"}
+  ]
+}

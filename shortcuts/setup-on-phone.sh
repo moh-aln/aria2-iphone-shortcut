@@ -189,11 +189,15 @@ awake_loop() {
   done
 }
 
-rest_unless_busy() {  # rest_unless_busy <id of the download that's ending>
+rest_unless_busy() {
+  # Any download's worker but the one that's ending (a new worker can have the same id).
   for id in $(ids); do
-    [ "$id" != "$1" ] && running "$id" && return 0
+    [ "$(cat "$JOBS/$id.pid" 2>/dev/null)" != "$$" ] && running "$id" && return 0
   done
   probing && return 0  # finding a video's qualities (see choose)
+  # An update (its lock is under an hour old: see update_now), which ends with this too.
+  [ -n "$(find "$JOBS" -maxdepth 1 -type d \( -name .updating -o -name .app-updating \) -mmin -60 2>/dev/null)" ] &&
+    return 0
   # The loop has a process group of its own (setsid), with its reader in it.
   if awake; then kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null; fi
   rm -f "$JOBS/.awake.pid"
@@ -211,7 +215,8 @@ revive() {
   for id in $(ids); do
     running "$id" || continue
     [ -n "$(find "$JOBS" -maxdepth 1 -name "$id.log" -mmin +5 2>/dev/null)" ] || continue
-    case $(tail -n 1 "$JOBS/$id.log") in
+    # yt-dlp -v prints "[debug] ffmpeg command line: …" after each of these.
+    case $(grep -v '^\[debug\] ' "$JOBS/$id.log" | tail -n 1) in
       '[Merger]'* | '[ExtractAudio]'* | '[Fixup'* | '[VideoRemuxer]'* | '[VideoConvertor]'* | \
         '=== moving to Files'*) continue ;;
     esac
@@ -221,7 +226,15 @@ revive() {
   done
 }
 
-fetch_file() {
+fetch_file() {  # fetch_file <link> <id>
+  # A name iSH-AOK can't keep (see fetch_video): once more as "download-<id>", with the
+  # link's extension. (A torrent names its own files.)
+  out=
+  if [ -e "$JOBS/$2.short" ]; then
+    case $1 in http* | ftp*)
+      out="--out=download-$2$(printf %s "${1%%[?#]*}" | sed -n 's|.*/[^/]*\(\.[A-Za-z0-9]\{1,8\}\)$|\1|p')" ;;
+    esac
+  fi
   # --file-allocation=none: don't write zeros for the whole file up front (slow on a phone).
   # --max-tries/--retry-wait: ride out the connection drops iOS causes when it suspends the app.
   # --seed-time=0: stop a torrent as soon as it finishes instead of seeding.
@@ -229,7 +242,7 @@ fetch_file() {
   aria2c --dir="$DEST" --continue=true --file-allocation=none \
     --max-tries=20 --retry-wait=15 --seed-time=0 --bt-stop-timeout=900 \
     --follow-torrent=mem --enable-color=false \
-    --show-console-readout=false --summary-interval=5 "$1"
+    --show-console-readout=false --summary-interval=5 ${out:+"$out"} "$1"
 }
 
 # The JavaScript engine yt-dlp uses to work out YouTube's video links: Node when it's
@@ -295,6 +308,9 @@ fetch_video() {  # fetch_video <link> <id>
   from=$1
   info=$JOBS/$2.info.json
   [ -n "$(find "$JOBS" -maxdepth 1 -name "$2.info.json" -mmin -60 2>/dev/null)" ] || info=
+  # And only the first time: YouTube's links are for the address that asked, and a retry or
+  # a resume may come from another network.
+  [ "$(grep -c '^=== start' "$JOBS/$2.log")" -le 1 ] || info=
   # Progress is printed in the same shape as aria2's summaries, so the list reads both the
   # same way. The title and the final file come from --exec, not --print, which would hide
   # yt-dlp's other output: the step it's on is what the list shows until the download
@@ -302,9 +318,17 @@ fetch_video() {  # fetch_video <link> <id>
   # A playlist link downloads the playlist into a folder named after it; a video link that
   # happens to come from a playlist (watch?v=…&list=…) downloads just that video.
   # Before each video, its picture is fetched in the background for the menus (see thumb).
+  # iSH-AOK keeps names escaped on iOS, which allows 255 bytes: a capital letter takes 2
+  # there, and every UTF-8 byte of anything not English takes 3. An Arabic title of 80 bytes
+  # (yt-dlp's own limit here once) came to about 280 with what yt-dlp adds while it works
+  # (".fhls-audio-128000-Audio.mp4.part-Frag23.part"): "Filename too long". 56 bytes of title
+  # leave room for that. If even that's too long, work starts it again named after the
+  # video's id (<id>.short).
+  folder='%(playlist_title|.).80B' title=${DL_TITLE:-%(title).56B}  # DL_TITLE: for tests
+  [ -e "$JOBS/$2.short" ] && folder='%(playlist_title|.).40B' title='%(id).40B'
   # -v puts yt-dlp's versions and every step it takes in the log, for the debug report
   # (see report); the list leaves its "[debug]" lines out.
-  set -- -v --newline --no-playlist --no-mtime -P "$DEST" -o '%(playlist_title|.).80B/%(title).80B.%(ext)s' \
+  set -- -v --newline --no-playlist --no-mtime -P "$DEST" -o "$folder/$title.%(ext)s" \
     -f "$fmt" $as $(js_runtime) \
     --exec 'before_dl:echo NAME: %(title)q' --exec 'after_move:echo FILE: %(filepath)q' \
     --exec "before_dl:sh '$0' --thumb $2 %(thumbnail)q >/dev/null 2>&1 &" \
@@ -315,12 +339,17 @@ fetch_video() {  # fetch_video <link> <id>
 work() {  # work <id>: the background worker, for as long as the download takes
   link=$(head -n 1 "$JOBS/$1.log")
   keep_awake
-  tool=aria2
-  if is_video_site "$link"; then
+  # A restart uses the tool the first start found: one failed look (iOS has only just
+  # woken the app) would send a page to aria2, which would download the page.
+  tool=$(sed -n 's/^=== via //p' "$JOBS/$1.log" | head -n 1)
+  if [ -n "$tool" ]; then
+    :
+  elif is_video_site "$link" || [ -s "$JOBS/$1.fmt" ]; then
     tool=yt-dlp
   else
+    tool=aria2
     case $link in http*)
-      type=$(curl -sL -m 20 -r 0-0 -o /dev/null -w '%{content_type}' "$link" 2>/dev/null)
+      type=$(curl -sL -m 20 -r 0-0 -o /dev/null -w '%{content_type}' "$link" 2>/dev/null | tr 'A-Z' 'a-z')
       case $type in text/html* | application/xhtml*) tool=yt-dlp ;; esac ;;
     esac
   fi
@@ -328,7 +357,7 @@ work() {  # work <id>: the background worker, for as long as the download takes
   # Run the tool as a child, so that without setsid a pause still reaches it.
   child=
   trap 'kill $child 2>/dev/null' TERM
-  if [ $tool = yt-dlp ]; then fetch_video "$link" "$1" & else fetch_file "$link" & fi
+  if [ $tool = yt-dlp ]; then fetch_video "$link" "$1" & else fetch_file "$link" "$1" & fi
   child=$!
   wait $child
   code=$?
@@ -338,10 +367,17 @@ work() {  # work <id>: the background worker, for as long as the download takes
     deliver "$1"
   fi
   echo "=== exit $code"
+  # A name iSH-AOK can't keep (see fetch_video): once more, with a short one.
+  if [ "$code" != 0 ] && [ ! -e "$JOBS/$1.short" ] && segment "$1" | grep -qi '\[Errno 36\]\|file \{0,1\}name too long'; then
+    : >"$JOBS/$1.short"
+    echo "=== the name is too long for iSH-AOK, so it starts again with a shorter one"
+    start "$link" "$1"
+    return
+  fi
   # Paused (or stopped): nothing else to do, and the sooner the worker is gone, the sooner
   # iSH-AOK can stop keeping itself awake.
   if segment "$1" | grep -q '^=== paused'; then
-    rest_unless_busy "$1"
+    rest_unless_busy
     return
   fi
   announce "$1"
@@ -349,7 +385,7 @@ work() {  # work <id>: the background worker, for as long as the download takes
   load "$1"
   [ "$state" = failed ] && save_report "$1"
   update_if_due
-  rest_unless_busy "$1"
+  rest_unless_busy
 }
 
 # thumb <id> <picture link>: a small square of the video's picture, base64, for the menus.
@@ -413,13 +449,13 @@ probe() {  # dl --probe: what probe_start runs
   keep_awake
   link=$(cat "$CHOICE/link")
   # --flat-playlist: a playlist is listed, not each of its videos found.
-  if yt-dlp -v --no-playlist --flat-playlist $(js_runtime) -J "$link" >"$CHOICE/info.new" 2>"$CHOICE/log" &&
+  if timeout 600 yt-dlp -v --no-playlist --flat-playlist $(js_runtime) -J "$link" >"$CHOICE/info.new" 2>"$CHOICE/log" &&
       python3 "$FORMATS" "$CHOICE/info.new" >"$CHOICE/rows.new" 2>>"$CHOICE/log" &&
       [ "$(cat "$CHOICE/link" 2>/dev/null)" = "$link" ]; then  # and not replaced meanwhile
     mv -f "$CHOICE/info.new" "$CHOICE/info"
     mv -f "$CHOICE/rows.new" "$CHOICE/rows"
+    : >"$CHOICE/done"  # the qualities needn't wait for the picture
     thumb_to "$CHOICE/thumb" "$(choice_field thumbnail)"
-    : >"$CHOICE/done"
   elif [ -d "$CHOICE" ]; then
     : >"$CHOICE/failed"
   fi
@@ -438,16 +474,26 @@ choice_field() {  # choice_field <title|thumbnail|playlist>: from the rows
   awk -F '\037' -v k="$1" '$1 == k { print $2; exit }' "$CHOICE/rows" 2>/dev/null
 }
 
+choice_count() {  # choice_count <video|audio>: how many of them the site has
+  if [ -f "$CHOICE/rows" ]; then awk -F '\037' -v k="$1" '$1 == k { n++ } END { print n + 0 }' "$CHOICE/rows"; else echo 0; fi
+}
+
 # chosen <format> [audio]: the quality is picked: start the download, and end the choice.
 # Fails after an answer for the Shortcut (from the share sheet: a notification, then close).
 chosen() {
   link=$(cat "$CHOICE/link")
   from=$(cat "$CHOICE/from")
+  if unfinished_in_list "$link"; then  # shared again meanwhile, and started
+    end_choice
+    finish "$(add "$link")"
+    return
+  fi
   last=$(ids | head -n 1)
   new=$((${last:-0} + 1))
   # If the format picked is gone by the time it's resumed (hours later, say), the best for
   # iPhone will do.
-  printf '%s/%s\n%s\n' "$1" "$(rule_format iphone)" "$2" >"$JOBS/$new.fmt"
+  if [ "$2" = audio ]; then fallback=$(rule_format audio | sed -n 1p); else fallback=$(rule_format iphone); fi
+  printf '%s/%s\n%s\n' "$1" "$fallback" "$2" >"$JOBS/$new.fmt"
   # What yt-dlp found goes with it, so it needn't look again; not for a playlist, though,
   # where it only listed the videos.
   if [ -e "$CHOICE/done" ] && [ -z "$(choice_field playlist)" ]; then
@@ -473,7 +519,9 @@ finish() {
 }
 
 segment() { # segment <id>: the log since the download's latest (re)start
-  awk '/^=== start/ { buf = "" } { buf = buf $0 "\n" } END { printf "%s", buf }' "$JOBS/$1.log"
+  # Lines kept in an array: adding each to one string copies it all every time in BusyBox
+  # awk, and a log of 10,000 lines took seconds.
+  awk '/^=== start/ { n = 0 } { line[++n] = $0 } END { for (i = 1; i <= n; i++) print line[i] }' "$JOBS/$1.log"
 }
 
 # Two kinds of update, each at most once a day after a download ends, and when the Shortcut
@@ -562,12 +610,15 @@ share_ready() {
   fi
 }
 
-deliver() {  # deliver <id>: move the finished download into $SHARE, if that's mounted
+# deliver <id> [all]: move the finished download into $SHARE, if that's mounted. "all" looks
+# at the whole log, not just since the latest start.
+deliver() {
   share_ready || return 0
+  if [ "$2" = all ]; then dlog=$(cat "$JOBS/$1.log"); else dlog=$(segment "$1"); fi
   # yt-dlp says FILE: for each finished file. aria2 says it in its summaries, which a quick
   # download may not live to print, and in its "Download Results" row: gid|OK|speed|path.
-  path=$(segment "$1" | sed -n 's/^FILE: //p' | tail -n 1)
-  [ -n "$path" ] || path=$(segment "$1" | grep -E '^[0-9a-f]+\|OK' | tail -n 1 | cut -d'|' -f4-)
+  path=$(printf '%s\n' "$dlog" | awk -v p="FILE: $DEST/" 'index($0, p) == 1 { f = substr($0, 7) } END { print f }')
+  [ -n "$path" ] || path=$(printf '%s\n' "$dlog" | grep -E '^[0-9a-f]+\|OK' | tail -n 1 | cut -d'|' -f4-)
   case $path in "$DEST"/*) ;; *) return 0 ;; esac
   # A playlist's or a torrent's file is in a folder: move that whole folder.
   top=${path#"$DEST"/}
@@ -579,8 +630,9 @@ deliver() {  # deliver <id>: move the finished download into $SHARE, if that's m
   if [ -d "$DEST/$top" ]; then
     # Merge into a folder of the same name, file by file, leaving out the partial files
     # of anything unfinished.
-    (cd "$DEST" && find "$top" -type f ! -name '*.part' ! -name '*.ytdl' ! -name '*.aria2') |
-      while IFS= read -r f; do place "$DEST/$f" "$SHARE/$f" >/dev/null; done
+    # ./ so that a name starting with - isn't taken for an option.
+    (cd "$DEST" && find "./$top" -type f ! -name '*.part' ! -name '*.ytdl' ! -name '*.aria2') |
+      while IFS= read -r f; do f=${f#./}; place "$DEST/$f" "$SHARE/$f" >/dev/null; done
     find "$DEST/$top" -depth -type d -exec rmdir {} \; 2>/dev/null  # only the empty ones
     echo "FILE: $SHARE/$top"
   elif to=$(place "$DEST/$top" "$SHARE/$top"); then
@@ -606,7 +658,11 @@ place() {
     while [ -e "$base ($i)$ext" ]; do i=$((i + 1)); done
     to="$base ($i)$ext"
   fi
-  mkdir -p "${to%/*}" && timeout 1800 mv "$1" "$to" && printf '%s\n' "$to"
+  # Moving into Files copies, then deletes: one cut short (a pause, iOS) would leave half a
+  # file under its real name. So it goes in under a hidden name, then gets its own.
+  part="${to%/*}/.${to##*/}.moving"
+  mkdir -p "${to%/*}" && rm -f "$part" && timeout 1800 mv "$1" "$part" && mv -f "$part" "$to" &&
+    printf '%s\n' "$to"
 }
 
 link_name() {
@@ -636,8 +692,13 @@ load() {
     *'=== paused'*) state=paused ;;
     *'=== exit '*)
       if [ "$code" = 0 ]; then state=done; else state=failed; fi
-      reason=$(printf '%s\n' "$seg" | grep -E 'errorCode=|^ERROR: ' | tail -n 1 |
-        sed 's/.*errorCode=[0-9]* //; s/^ERROR: //; s/^\[[^]]*\] [^:]*: //; s/^Unsupported URL.*/no video found on this page/' |
+      # The first error from the system says why; yt-dlp's last one may only say that the
+      # file came out empty.
+      errs=$(printf '%s\n' "$seg" | grep -E 'errorCode=|^ERROR: ')
+      reason=$({ printf '%s\n' "$errs" | grep -m 1 '\[Errno [0-9]*\]' || printf '%s\n' "$errs" | tail -n 1; } |
+        sed 's/.*errorCode=[0-9]* //; s/^ERROR: //; s/^\[[^]]*\] [^:]*: //; s/^Unsupported URL.*/no video found on this page/
+          s/.*\[Errno 36\].*/the name was too long for iSH-AOK/; s/.*[Ff]ile \{0,1\}name too long.*/the name was too long for iSH-AOK/
+          s/.*\[Errno 28\].*/no space left on the iPhone/' |
         cut -c1-120) ;;
     *) if running "$1"; then state=running; else state=paused; fi ;;  # paused: iOS ended it
   esac
@@ -803,12 +864,23 @@ incoming() {
   from=$2
   link=$(links_in "$1")
   if [ ! -e "$JOBS/.no-ask" ] && [ -z "$(find "$JOBS" -maxdepth 1 -name .bark-next -mmin -5 2>/dev/null)" ] &&
-      [ -n "$link" ] && [ "$(printf '%s\n' "$link" | wc -l)" = 1 ] && page "$link"; then
+      [ -n "$link" ] && [ "$(printf '%s\n' "$link" | wc -l)" = 1 ] && page "$link" && ! unfinished_in_list "$link"; then
     choose "$link" "$from"
     screen=choose
     return 0
   fi
   finish "$(add_links "$1")"
+}
+
+# unfinished_in_list <link>: is it on the list, running or paused? Then sharing it again
+# carries it on (add) rather than starting a second download into the same files.
+unfinished_in_list() {
+  for i in $(ids); do
+    [ "$(head -n 1 "$JOBS/$i.log")" = "$1" ] || continue
+    load "$i"
+    case $state in running | paused) return 0 ;; esac
+  done
+  return 1
 }
 
 page() {  # page <link>: is it a page, which may have a video in it, rather than a file?
@@ -1020,7 +1092,7 @@ act() {  # act <chosen menu line>
 # notifications), .menu (one line per row on show: its key, a tab, then what it showed)
 # and .notice (a message for the next screen: a title line, then a detail line).
 
-KEEP_FINISHED=6  # finished downloads the list keeps; older ones drop off it (files stay)
+KEEP_FINISHED=${DL_KEEP:-6}  # finished downloads the list keeps; older ones drop off it (files stay)
 ICONS=${DL_ICONS:-/usr/local/share/dl/icons}  # the pictures, base64 PNGs, from setup
 BARK_APP=https://apps.apple.com/app/bark-custom-notifications/id1403753865
 WEB=${DL_WEB:-/usr/local/share/dl/web.py}  # the live view's server, from setup
@@ -1036,6 +1108,16 @@ ui() {  # ui <what was tapped>
   pageno=1
   [ -s "$JOBS/.page" ] && [ "$(sed -n 1p "$JOBS/.page")" = "$screen" ] && pageno=$(sed -n 2p "$JOBS/.page")
   before=$screen
+  # iOS counts each row picked from a menu with pictures (vCards, which it takes for
+  # contacts) that goes on to iSH-AOK, for all of one run of the shortcut, and stops the
+  # 11th: "This action is trying to share 11 Contacts items, which is not allowed", however
+  # short the menus. So after 10, menus are plain lines (which it doesn't count) until the
+  # shortcut is opened again, unless iOS Settings allows more (.no-limit, see pictures).
+  case $1 in
+    @@start | @@add:*) echo 0 >"$JOBS/.picks"; rm -f "$JOBS/.picks-told" ;;
+    @@* | '') ;;
+    *) [ -e "$JOBS/.cards" ] && echo $(($(picks) + 1)) >"$JOBS/.picks" ;;
+  esac
   case $1 in
     @@start) screen=main; opening || return 0 ;;
     @@add:*) incoming "${1#@@add:}" share || return 0 ;;    # shared to the Shortcut
@@ -1051,6 +1133,11 @@ ui() {  # ui <what was tapped>
   printf '%s\n%s\n' "$screen" "$pageno" >"$JOBS/.page"
   cards=  # pictures, unless they're off or the shortcut can't show them
   [ -n "$SHORTCUT" ] && [ ! -e "$JOBS/.plain" ] && cards=1
+  plain_now=
+  if [ -n "$cards" ] && [ ! -e "$JOBS/.no-limit" ] && [ "$(picks)" -ge "${DL_TAPS:-10}" ]; then
+    cards= plain_now=1
+  fi
+  if [ -n "$cards" ]; then : >"$JOBS/.cards"; else rm -f "$JOBS/.cards"; fi
   case $screen in main | list | item\ *) revive ;; esac  # see revive
   echo "$screen" >"$JOBS/.screen"
   rows=$JOBS/.rows.$$
@@ -1059,6 +1146,11 @@ ui() {  # ui <what was tapped>
     { IFS= read -r title; IFS= read -r detail; } <"$JOBS/.notice"
     row notice ℹ️ "$title" "$detail"
     : >"$JOBS/.notice"
+  fi
+  if [ -n "$plain_now" ] && [ ! -e "$JOBS/.picks-told" ]; then  # the first plain menu says why
+    : >"$JOBS/.picks-told"
+    row notice ℹ️ "Plain menus for now" "iOS allows 10 picture taps a run"
+    row nolimit 🔓 "Allowed more in iOS Settings?" "Then tap here for pictures"
   fi
   case $screen in
     list) list_screen ;;
@@ -1187,7 +1279,7 @@ tapped() {  # tapped <key>: act on the row tapped. Fails after printing an answe
     resumeall) notice "$(resume_all)" ;;
     clear) notice "$(clear_finished)" ;;
     pause) pause "$id"; rest_unless_busy ;;
-    resume) load "$id"; start "$link" "$id" ;;
+    resume) load "$id"; running "$id" || start "$link" "$id" ;;  # a double tap starts one
     stop) notice "$(stop "$id")"; screen=list ;;
     remove) load "$id"; forget "$id"; notice "Removed from the list" "${playlist:-$name}"; screen=list ;;
     open) open_download "$id" || return 1 ;;
@@ -1213,9 +1305,13 @@ tapped() {  # tapped <key>: act on the row tapped. Fails after printing an answe
       fi
       screen=pick ;;
     v:*)
+      # Its sound comes with it, or there's none to add, or only one: nothing to ask.
       spec=${1#v:}
-      if [ "${spec##*:}" = 1 ]; then  # it has its own sound
+      na=$(choice_count audio)
+      if [ "${spec##*:}" = 1 ] || [ "$na" -eq 0 ]; then
         chosen "${spec%:*}" || return 1
+      elif [ "$na" -eq 1 ]; then
+        chosen "${spec%:*}+$(awk -F '\037' '$1 == "audio" { print $2; exit }' "$CHOICE/rows")" || return 1
       else
         echo "${spec%:*}" >"$CHOICE/video"
         screen=sound
@@ -1253,7 +1349,17 @@ tapped() {  # tapped <key>: act on the row tapped. Fails after printing an answe
         notice "Updating the tools" "Tap 🔧 again to see how it's going"
       fi ;;
     auto) flip .no-auto-update ;;
-    pictures) flip .plain ;;
+    # Pictures: for 10 taps a run (see ui) → always, once iOS Settings allows it → off → …
+    pictures)
+      if [ -e "$JOBS/.plain" ]; then
+        rm -f "$JOBS/.plain" "$JOBS/.no-limit"
+      elif [ -e "$JOBS/.no-limit" ]; then
+        : >"$JOBS/.plain"
+      else
+        : >"$JOBS/.no-limit"
+        notice "Only if iOS allows it" "Settings → Apps → Shortcuts → Advanced → Allow Sharing Large Amounts of Data"
+      fi ;;
+    nolimit) : >"$JOBS/.no-limit" ;;
     ish) echo @@app; return 1 ;;
     bark-store) open_link "$BARK_APP"; return 1 ;;
     bark-paste) : >"$JOBS/.bark-next"; echo @@clipboard; return 1 ;;  # see add_links
@@ -1310,6 +1416,7 @@ import_shortcut() {
 }
 
 main_screen() {
+  prune  # shares from the share sheet never open the list, which is where it used to happen
   [ -s "$SHORTCUTS/.pending" ] && row import 🆕 "New aria2 shortcut" "Tap to install it, then tap Replace"
   running=0 paused=0 finished=0 sum=0 known=0
   for id in $(ids); do
@@ -1464,9 +1571,25 @@ choose_screen() {
   [ -s "$CHOICE/thumb" ] && pic=$CHOICE/thumb
   row self 🎬 "${title:-$(link_name "$link")}" "$(host_of "$link")" "$pic"
   row quick ⚡ "Quick download" "$(rule_label) · $(rule_detail)"
-  row pick 🎚 "Choose the quality" "Pick the video and the sound"
+  # What there is to choose from, once it's known; nothing to choose, no row.
+  if [ -e "$CHOICE/failed" ]; then
+    row pick 🎚 "Choose the quality" "Couldn't find what it has: tap to see why"
+  elif [ ! -e "$CHOICE/done" ]; then
+    row pick 🎚 "Choose the quality" "Finding what it has…"
+  elif [ -n "$(choice_field playlist)" ]; then
+    row pick 🎚 "Choose the quality" "One quality for all $(choice_field playlist) videos"
+  else
+    nv=$(choice_count video) na=$(choice_count audio)  # not videos: load uses it
+    if [ "$nv" -gt 1 ] || [ "$na" -gt 1 ]; then
+      what="$nv $(plural "$nv" "video quality" "video qualities")"
+      [ "$na" -gt 0 ] && what="$what · $na $(plural "$na" sound sounds)"
+      row pick 🎚 "Choose the quality" "$what"
+    fi
+  fi
   [ "$(cat "$JOBS/.quality" 2>/dev/null)" = audio ] || row audio-quick 🎵 "Audio only" "Just the sound, as M4A"
 }
+
+plural() { if [ "$1" = 1 ]; then echo "$2"; else echo "$3"; fi; }  # plural <n> <one> <more>
 
 pick_screen() {  # the qualities yt-dlp found
   row back:choose ⬅️ Back
@@ -1576,12 +1699,20 @@ settings_screen() {
   else
     row auto 🔁 "Automatic updates" "Off" auto
   fi
-  if [ -n "$SHORTCUT" ]; then
-    row pictures 🖼 "Pictures in menus" "$(on_off_flag "$JOBS/.plain")"
+  if [ -z "$SHORTCUT" ]; then
+    :
+  elif [ -e "$JOBS/.plain" ]; then
+    row pictures 🖼 "Pictures in menus" "Off"
+  elif [ -e "$JOBS/.no-limit" ]; then
+    row pictures 🖼 "Pictures in menus" "Always (iOS Settings allows it)"
+  else
+    row pictures 🖼 "Pictures in menus" "For 10 taps a run, then plain"
   fi
   report_row report "Everything aria2 knows"
   row ish 📲 "Open iSH-AOK" "The terminal behind aria2"
 }
+
+picks() { taps=$(cat "$JOBS/.picks" 2>/dev/null); echo "${taps:-0}"; }  # see ui
 
 on_off_flag() { if [ -e "$1" ]; then echo Off; else echo On; fi; }  # On unless <file> is there
 
@@ -1706,7 +1837,7 @@ delete_download() {  # delete_download <id>: prints what it did, as a title line
     forget "$1"
     echo "Removed $name from the list"
     echo "Its file was already gone"
-  elif [ -f "$path" ] && timeout 60 rm -f "$path"; then
+  elif [ -f "$path" ] && timeout 15 rm -f "$path"; then
     forget "$1"
     echo "Deleted $name"
     echo "It's gone from Files"
@@ -1747,7 +1878,7 @@ report() {
   [ -e "$LOCATION" ] || updates="no $LOCATION"
   [ -e "$LOCATION" ] && timeout 5 head -c 1 "$LOCATION" >/dev/null 2>&1 && updates=arriving
   echo "Keeping iSH-AOK awake: $awake · location updates: $updates"
-  echo "Settings: notifications $(on_off "$JOBS/.bark") · automatic updates $(auto_updates && echo on || echo off) · pictures $(on_off_flag "$JOBS/.plain")"
+  echo "Settings: notifications $(on_off "$JOBS/.bark") · automatic updates $(auto_updates && echo on || echo off) · pictures $(if [ -e "$JOBS/.plain" ]; then echo off; elif [ -e "$JOBS/.no-limit" ]; then echo always; else echo "for 10 taps a run"; fi) ($(picks) this run)"
   echo
   echo "== The list"
   status
@@ -1758,11 +1889,22 @@ report() {
     echo
     echo "== Download #$rid: $state${reason:+ ($reason)} · worker running: $worker"
     # Progress lines and aria2's summaries repeat every second or so: keep the last one.
+    # yt-dlp -v prints a Python traceback with every error: keep the first. A long log
+    # keeps its start (the link, the format) and its end.
     awk '/^\[#/ { last = $0; next }
       /^\*\*\* Download Progress Summary/ || /^-+$/ || /^ *$/ { next }
+      /^Traceback |^During handling of/ { if (shown) { skip = 1; next } first = 1 }
+      /^[ \t]/ && (skip || shown) { next }
+      !/^[ \t]/ && !/^Traceback / { if (first) { first = 0; shown = 1 } skip = 0 }
       $0 == previous { next }
       { if (last != "") { print last; last = "" } print; previous = $0 }
-      END { if (last != "") print last }' "$JOBS/$rid.log" | tail -n 300
+      END { if (last != "") print last }' "$JOBS/$rid.log" |
+      awk '{ line[NR] = $0 }
+        END {
+          for (i = 1; i <= NR; i++)
+            if (NR <= 300 || i <= 60 || i > NR - 240) print line[i]
+            else if (i == 61) print "… " NR - 300 " lines left out …"
+        }'
   fi
   if [ -s "$CHOICE/link" ]; then
     found="still looking"
@@ -1774,7 +1916,7 @@ report() {
     echo "== Choosing the quality since $(date -r "$CHOICE/link" '+%H:%M:%S'): $found · finding them: $finding"
     cat "$CHOICE/link"
   fi
-  for log in .update.log .app-update.log .web.log .choice/log; do
+  for log in .update.log .app-update.log .web.log .choice/log .ui-errors.log; do
     [ -s "$JOBS/$log" ] || continue
     echo
     echo "== $log"
@@ -1831,17 +1973,17 @@ web_ok() {  # can this shortcut show it, and is it installed?
 # if it isn't answering. Each start gets a new token, which every request has to carry.
 web_link() {
   token=$(cat "$JOBS/.web-token" 2>/dev/null)
-  if [ -z "$token" ] || ! curl -fs -m 2 -o /dev/null "http://127.0.0.1:$WEB_PORT/status?t=$token"; then
+  # /hello only checks the token, where /status reads every download's log.
+  if [ -z "$token" ] || ! curl -fs -m 3 -o /dev/null "http://127.0.0.1:$WEB_PORT/hello?t=$token"; then
     pkill -f "$WEB $WEB_PORT" 2>/dev/null
     token=$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')
     echo "$token" >"$JOBS/.web-token"
     WEB_DEST=$DEST WEB_SHARE=$SHARE WEB_SHARE_HOST=$(share_host) WEB_DL=$0 \
       $(command -v setsid) nohup python3 "$WEB" "$WEB_PORT" "$token" >"$JOBS/.web.log" 2>&1 </dev/null &
-    # Python takes a few seconds to start in iSH-AOK; the Shortcut gives up after 20.
-    tries=0
-    until curl -fs -m 2 -o /dev/null "http://127.0.0.1:$WEB_PORT/status?t=$token"; do
-      tries=$((tries + 1))
-      [ $tries -ge 24 ] && return 1
+    # Python takes a few seconds to start in iSH-AOK, and a Run Command gets about 30 s.
+    since=$(date +%s)
+    until curl -fs -m 2 -o /dev/null "http://127.0.0.1:$WEB_PORT/hello?t=$token"; do
+      [ $(($(date +%s) - since)) -ge 12 ] && return 1
       sleep 0.5
     done
   fi
@@ -1863,7 +2005,7 @@ web_act() {  # web_act <id> <pause|resume|stop|again>: the live view's buttons
   load "$1"
   case $2 in
     pause) pause "$1"; rest_unless_busy; echo "Paused ${playlist:-$name}" ;;
-    resume) start "$link" "$1"; echo "Resumed ${playlist:-$name}" ;;
+    resume) running "$1" || start "$link" "$1"; echo "Resumed ${playlist:-$name}" ;;
     stop) out=$(stop "$1"); printf '%s\n' "$out" | head -n 1 ;;
     again) out=$(again "$1"); printf '%s\n' "$out" | tail -n 1 | sed 's/^/Downloading again: /' ;;
   esac
@@ -1914,7 +2056,7 @@ prune() {
 }
 
 forget() {  # forget <id>: drop it from the list
-  rm -f "$JOBS/$1.log" "$JOBS/$1.pid" "$JOBS/$1.thumb" "$JOBS/$1.fmt" "$JOBS/$1.info.json"
+  rm -f "$JOBS/$1.log" "$JOBS/$1.pid" "$JOBS/$1.thumb" "$JOBS/$1.fmt" "$JOBS/$1.info.json" "$JOBS/$1.short"
 }
 
 # Stop a download for good: delete what it left unfinished. A playlist that finished some
@@ -1925,14 +2067,16 @@ stop() {  # stop <id>
   title=${playlist:-$name}
   [ "$state" = running ] && pause "$1"
   rest_unless_busy
+  kept=0
   if [ "$via" = yt-dlp ]; then
     # yt-dlp names each file it starts ("[download] Destination: …"), and says FILE: for
-    # each one it finished.
-    finished=$(segment "$1" | sed -n 's/^FILE: //p')
-    segment "$1" | sed -n 's/^\[download\] Destination: //p' | while IFS= read -r p; do
+    # each one it finished: in the whole log, since a resumed download carries on from what
+    # it did before.
+    finished=$(sed -n 's/^FILE: //p' "$JOBS/$1.log")
+    sed -n 's/^\[download\] Destination: //p' "$JOBS/$1.log" | sort -u | while IFS= read -r p; do
       printf '%s\n' "$finished" | grep -qxF -- "$p" || unfinished "$p"
     done
-    deliver "$1" >>"$JOBS/$1.log"
+    kept=$(printf '%s\n' "$finished" | awk -v p="$DEST/" 'index($0, p) == 1' | sort -u | wc -l)
   else
     # aria2 names its file (a torrent's first file) in FILE: lines while it downloads.
     segment "$1" | sed -n 's/^FILE: //p' | sort -u | while IFS= read -r p; do
@@ -1946,11 +2090,12 @@ stop() {  # stop <id>
       fi
     done
   fi
-  load "$1"
   echo "Stopped $title"
-  if [ -n "$playlist" ] && [ "$videos" -gt 0 ]; then
+  if [ -n "$playlist" ] && [ "$kept" -gt 0 ]; then
     echo "=== stopped" >>"$JOBS/$1.log"
-    echo "Kept the $videos video(s) it had finished"
+    # Moving them can take longer than a Run Command may.
+    $(command -v setsid) nohup sh "$0" --deliver "$1" >>"$JOBS/$1.log" 2>&1 </dev/null &
+    echo "Kept the $kept video(s) it had finished"
   else
     forget "$1"
     echo "Deleted what it had downloaded"
@@ -1963,9 +2108,20 @@ unfinished() {  # unfinished <path>: delete a partial download, only ever inside
 }
 
 case $1 in
-  -ui) [ "$4" = -k ] && SHORTCUT=$5; ui "$(decode "$3")" ;;
+  -ui)
+    # Run Command returns what's printed to stderr too: one stray error before a screen of
+    # vCards, and the shortcut takes it for plain lines. So errors go to a log (in the
+    # report), cut back to its end now and then.
+    if [ -n "$(find "$JOBS/.ui-errors.log" -size +64k 2>/dev/null)" ]; then
+      tail -n 200 "$JOBS/.ui-errors.log" >"$JOBS/.ui-errors.log.$$"
+      mv -f "$JOBS/.ui-errors.log.$$" "$JOBS/.ui-errors.log"
+    fi
+    exec 2>>"$JOBS/.ui-errors.log"
+    [ "$4" = -k ] && SHORTCUT=$5
+    ui "$(decode "$3")" ;;
   --shortcut) base64 "$SHORTCUTS/aria2.shortcut" | tr -d '\n' ;;  # for @@import
   --work) work "$2" ;;
+  --deliver) deliver "$2" all ;;   # what a stopped playlist finished (see stop)
   --thumb) thumb "$2" "$3" ;;
   --act) web_act "$2" "$3" ;;      # the live view's buttons (web.py)
   --awake) keep_awake; revive ;;   # while the live view is open
@@ -2291,6 +2447,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, "ok", "text/plain")
         if not self.allowed(query):
             return self.send(403, "Open this from the aria2 shortcut.", "text/plain")
+        if url.path == "/hello":  # is this the server with this token? (dl's web_link)
+            return self.send(200, "ok", "text/plain")
         t = "?t=" + TOKEN
         if url.path == "/":
             return self.send(200, PAGE.replace("{{TOKEN}}", TOKEN))
@@ -2600,8 +2758,10 @@ prints one row per line, its fields joined by \\x1f, for dl to show:
     playlist  <how many videos>                  (a playlist: no qualities to pick from)
     video     <format> <label> <detail> <1 if it has its own sound, else 0>
     audio     <format> <label> <detail>
-Videos come one per resolution, best first: H.264 where the site has it, since the iPhone
-plays it everywhere, and otherwise the best of the rest. Sounds come best first.
+Videos come one per resolution, best first: one the iPhone plays everywhere (H.264) where
+the site has it, then one with its own sound, which needs no second download, then the
+highest bitrate. Each says whether its sound comes with it, is picked next, or doesn't
+exist. Sounds come best first.
 """
 import json
 import sys
@@ -2636,6 +2796,13 @@ def has(value):
     return value != "none"
 
 
+def plays(f):
+    # H.264 plays everywhere on the iPhone. So, likely, does an MP4 whose codec the site
+    # doesn't say: X's progressive MP4s, which have their sound in them.
+    name = codec(f.get("vcodec"))
+    return name == "H.264" or (name == "" and f.get("ext") in ("mp4", "m4v", "mov"))
+
+
 def row(*fields):
     print(SEP.join(str(x).replace(SEP, " ").replace("\n", " ") for x in fields))
 
@@ -2652,23 +2819,6 @@ def main(path):
     formats = [f for f in info.get("formats") or [info] if f.get("url") or f.get("format_id")]
     formats = [f for f in formats if "storyboard" not in (f.get("format_note") or "") and f.get("ext") != "mhtml"]
 
-    # Videos: the best of each height (and frame rate), H.264 first.
-    best = {}
-    for f in formats:
-        if f.get("vcodec") == "none":
-            continue
-        fps = f.get("fps") or 0
-        key = (f.get("height") or 0, 60 if fps > 30 else 30)
-        rank = (codec(f.get("vcodec")) == "H.264", f.get("tbr") or 0, has(f.get("acodec")))
-        if key not in best or rank > best[key][0]:
-            best[key] = (rank, f)
-    for (height, fps), (_, f) in sorted(best.items(), key=lambda kv: kv[0], reverse=True):
-        name = codec(f.get("vcodec"))
-        label = f"{height}p" + ("60" if fps == 60 else "") if height else (f.get("format_note") or f.get("ext") or "Video")
-        plays = "plays everywhere" if name in ("H.264", "") else "may not play in Files"
-        detail = " · ".join(x for x in (name, size(f), plays) if x)
-        row("video", f["format_id"], label, detail, 1 if has(f.get("acodec")) else 0)
-
     # Sounds on their own: one of each codec, bitrate and language, best first.
     seen, sounds = set(), []
     languages = {f.get("language") for f in formats if f.get("vcodec") == "none" and has(f.get("acodec"))}
@@ -2681,12 +2831,32 @@ def main(path):
             continue
         seen.add(key)
         sounds.append((rate, name == "AAC", f, name))
-    for rate, _, f, name in sorted(sounds, key=lambda s: (s[1], s[0]), reverse=True)[:8]:
+    sounds = sorted(sounds, key=lambda s: (s[1], s[0]), reverse=True)[:8]
+
+    # Videos: the best of each height (and frame rate).
+    best = {}
+    for f in formats:
+        if f.get("vcodec") == "none":
+            continue
+        fps = f.get("fps") or 0
+        key = (f.get("height") or 0, 60 if fps > 30 else 30)
+        rank = (plays(f), has(f.get("acodec")), f.get("tbr") or 0)
+        if key not in best or rank > best[key][0]:
+            best[key] = (rank, f)
+    for (height, fps), (_, f) in sorted(best.items(), key=lambda kv: kv[0], reverse=True):
+        name = codec(f.get("vcodec"))
+        label = f"{height}p" + ("60" if fps == 60 else "") if height else (f.get("format_note") or f.get("ext") or "Video")
+        own = has(f.get("acodec"))
+        sound = "with sound" if own else ("sound next" if sounds else "no sound")
+        detail = " · ".join(x for x in (name, size(f), "plays everywhere" if plays(f) else "may not play in Files", sound) if x)
+        row("video", f["format_id"], label, detail, 1 if own else 0)
+
+    for rate, _, f, name in sounds:
         label = " · ".join(x for x in (name, f"{rate} kbps" if rate else "") if x)
         if len(languages) > 1 and f.get("language"):
             label += f" · {f['language']}"
-        plays = "plays everywhere" if name in ("AAC", "MP3") else "may not play everywhere"
-        row("audio", f["format_id"], label, " · ".join(x for x in (size(f), plays) if x))
+        plays_ = "plays everywhere" if name in ("AAC", "MP3") else "may not play everywhere"
+        row("audio", f["format_id"], label, " · ".join(x for x in (size(f), plays_) if x))
 
 
 if __name__ == "__main__":

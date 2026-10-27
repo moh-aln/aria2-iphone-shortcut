@@ -227,6 +227,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, "ok", "text/plain")
         if not self.allowed(query):
             return self.send(403, "Open this from the aria2 shortcut.", "text/plain")
+        if url.path == "/hello":  # is this the server with this token? (dl's web_link)
+            return self.send(200, "ok", "text/plain")
         t = "?t=" + TOKEN
         if url.path == "/":
             return self.send(200, PAGE.replace("{{TOKEN}}", TOKEN))

@@ -9,8 +9,10 @@ prints one row per line, its fields joined by \\x1f, for dl to show:
     playlist  <how many videos>                  (a playlist: no qualities to pick from)
     video     <format> <label> <detail> <1 if it has its own sound, else 0>
     audio     <format> <label> <detail>
-Videos come one per resolution, best first: H.264 where the site has it, since the iPhone
-plays it everywhere, and otherwise the best of the rest. Sounds come best first.
+Videos come one per resolution, best first: one the iPhone plays everywhere (H.264) where
+the site has it, then one with its own sound, which needs no second download, then the
+highest bitrate. Each says whether its sound comes with it, is picked next, or doesn't
+exist. Sounds come best first.
 """
 import json
 import sys
@@ -45,6 +47,13 @@ def has(value):
     return value != "none"
 
 
+def plays(f):
+    # H.264 plays everywhere on the iPhone. So, likely, does an MP4 whose codec the site
+    # doesn't say: X's progressive MP4s, which have their sound in them.
+    name = codec(f.get("vcodec"))
+    return name == "H.264" or (name == "" and f.get("ext") in ("mp4", "m4v", "mov"))
+
+
 def row(*fields):
     print(SEP.join(str(x).replace(SEP, " ").replace("\n", " ") for x in fields))
 
@@ -61,23 +70,6 @@ def main(path):
     formats = [f for f in info.get("formats") or [info] if f.get("url") or f.get("format_id")]
     formats = [f for f in formats if "storyboard" not in (f.get("format_note") or "") and f.get("ext") != "mhtml"]
 
-    # Videos: the best of each height (and frame rate), H.264 first.
-    best = {}
-    for f in formats:
-        if f.get("vcodec") == "none":
-            continue
-        fps = f.get("fps") or 0
-        key = (f.get("height") or 0, 60 if fps > 30 else 30)
-        rank = (codec(f.get("vcodec")) == "H.264", f.get("tbr") or 0, has(f.get("acodec")))
-        if key not in best or rank > best[key][0]:
-            best[key] = (rank, f)
-    for (height, fps), (_, f) in sorted(best.items(), key=lambda kv: kv[0], reverse=True):
-        name = codec(f.get("vcodec"))
-        label = f"{height}p" + ("60" if fps == 60 else "") if height else (f.get("format_note") or f.get("ext") or "Video")
-        plays = "plays everywhere" if name in ("H.264", "") else "may not play in Files"
-        detail = " · ".join(x for x in (name, size(f), plays) if x)
-        row("video", f["format_id"], label, detail, 1 if has(f.get("acodec")) else 0)
-
     # Sounds on their own: one of each codec, bitrate and language, best first.
     seen, sounds = set(), []
     languages = {f.get("language") for f in formats if f.get("vcodec") == "none" and has(f.get("acodec"))}
@@ -90,12 +82,32 @@ def main(path):
             continue
         seen.add(key)
         sounds.append((rate, name == "AAC", f, name))
-    for rate, _, f, name in sorted(sounds, key=lambda s: (s[1], s[0]), reverse=True)[:8]:
+    sounds = sorted(sounds, key=lambda s: (s[1], s[0]), reverse=True)[:8]
+
+    # Videos: the best of each height (and frame rate).
+    best = {}
+    for f in formats:
+        if f.get("vcodec") == "none":
+            continue
+        fps = f.get("fps") or 0
+        key = (f.get("height") or 0, 60 if fps > 30 else 30)
+        rank = (plays(f), has(f.get("acodec")), f.get("tbr") or 0)
+        if key not in best or rank > best[key][0]:
+            best[key] = (rank, f)
+    for (height, fps), (_, f) in sorted(best.items(), key=lambda kv: kv[0], reverse=True):
+        name = codec(f.get("vcodec"))
+        label = f"{height}p" + ("60" if fps == 60 else "") if height else (f.get("format_note") or f.get("ext") or "Video")
+        own = has(f.get("acodec"))
+        sound = "with sound" if own else ("sound next" if sounds else "no sound")
+        detail = " · ".join(x for x in (name, size(f), "plays everywhere" if plays(f) else "may not play in Files", sound) if x)
+        row("video", f["format_id"], label, detail, 1 if own else 0)
+
+    for rate, _, f, name in sounds:
         label = " · ".join(x for x in (name, f"{rate} kbps" if rate else "") if x)
         if len(languages) > 1 and f.get("language"):
             label += f" · {f['language']}"
-        plays = "plays everywhere" if name in ("AAC", "MP3") else "may not play everywhere"
-        row("audio", f["format_id"], label, " · ".join(x for x in (size(f), plays) if x))
+        plays_ = "plays everywhere" if name in ("AAC", "MP3") else "may not play everywhere"
+        row("audio", f["format_id"], label, " · ".join(x for x in (size(f), plays_) if x))
 
 
 if __name__ == "__main__":

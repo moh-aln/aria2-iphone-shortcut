@@ -8,6 +8,8 @@ tmp=$(mktemp -d)
 export DL_DIR="$tmp/Downloads"
 # Stands in for the Files folder mounted at /mnt/phone: finished downloads move here.
 export DL_SHARE="$tmp/Share"
+export DL_TAPS=100000  # a run of the shortcut taps many times here; the limit has its own test
+export DL_KEEP=1000  # the list keeps the newest 6 finished downloads; tests look at older ones
 mkdir "$DL_SHARE"
 # Stand-ins for /root/Shortcuts and for the setup script in the project's repository.
 export DL_SHORTCUTS="$tmp/Shortcuts"
@@ -78,6 +80,8 @@ printf '<!doctype html><title>Audio test</title><video src="rabbit2.mp4"></video
 printf '<!doctype html><title>Second playlist</title><video src="rabbit.mp4"></video><video src="rabbit2.mp4"></video>\n' \
   >"$tmp/www/list2.html"
 printf 'third\n' >"$tmp/www/note3.txt"
+printf '<!doctype html><title>%s</title><video src="rabbit.mp4"></video>\n' \
+  "A title that makes a file name too long when it comes six times" >"$tmp/www/long.html"
 # The menus' pictures, as setup installs them.
 export DL_ICONS="$tmp/icons"
 mkdir "$DL_ICONS"
@@ -290,12 +294,14 @@ check "ui: ...and back on" "$screen" "🔁 Automatic updates · On"
 check "ui: Back from Settings" "$(tap '⬅️ Back')" "📥 Downloads"
 
 dl "$SLOW_PAGE" >/dev/null
+export DL_KEEP=6
 screen=$(ui @@start)
 screen=$(tap '📥 Downloads')
 check "ui: the list starts with Back" "$(printf '%s\n' "$screen" | head -n 1)" "⬅️ Back"
 finished=$(printf '%s\n' "$screen" | grep -c -E '^(✅|⚠️) ')
 [ "$finished" -le 6 ] && ok "ui: the list keeps at most 6 finished downloads" ||
   fail "ui: $finished finished downloads listed"
+export DL_KEEP=1000
 case $screen in *' #'[0-9]*) fail "ui: the list still shows numbers: $screen" ;; *) ok "ui: no numbers in the list" ;; esac
 check "ui: a finished video, without .mp4" "$screen" "✅ Rabbit test page (1) · Downloaded · "
 screen=$(tap '✅ Rabbit test page')
@@ -357,9 +363,29 @@ check "cards: with a picture" "$cards" "PHOTO;ENCODING=b:iVBORw0KGgo"
 check "cards: opening the Downloads folder" "$(uik 'Downloads folder')" "@@open:shareddocuments://$DL_SHARE"
 cards=$(uik Settings)
 check "cards: tapping a title" "$cards" "N;CHARSET=utf-8:Pictures in menus;;;;"
-check "cards: the plain lines' setting is there too" "$(uik 'Pictures in menus')" "🖼 Pictures in menus · Off"
-check "cards: ...and turns back on" "$(dl -ui -b "$(b64 '🖼 Pictures in menus · Off')" -k oldver0)" "N;CHARSET=utf-8:Pictures in menus;;;;"
+check "cards: pictures always, once iOS Settings allows it" "$(uik 'Pictures in menus')" \
+  "ORG;CHARSET=utf-8:Always (iOS Settings allows it);"
+check "cards: then off, as plain lines" "$(uik 'Pictures in menus')" "🖼 Pictures in menus · Off"
+check "cards: ...and back on, for 10 taps a run" "$(dl -ui -b "$(b64 '🖼 Pictures in menus · Off')" -k oldver0)" \
+  "ORG;CHARSET=utf-8:For 10 taps a run\, then plain;"
 uik Back >/dev/null
+# iOS stops the 11th row picked from menus with pictures in one run ("trying to share 11
+# Contacts items"), so after 10 the menus are plain lines, which it doesn't count.
+export DL_TAPS=10  # the rest of the tests tap on more than that (see the top)
+uik @@start >/dev/null
+for i in 1 2 3 4; do uik Settings >/dev/null; uik Back >/dev/null; done
+uik Settings >/dev/null
+screen=$(uik Back)
+check "cards: after 10 taps in one run, plain lines" "$screen" "ℹ️ Plain menus for now · iOS allows 10 picture taps a run"
+tapk() { uik "$(grep -F "$1" "$DL_DIR/.logs/.menu" | head -n 1 | cut -f 2-)"; }  # the line with $1 in it
+check "...the next one too, without saying it again" "$(tapk '📥 Downloads')" "⬅️ Back"
+case $(tapk '⬅️ Back') in *'Plain menus for now'*) fail "it said so again" ;; *) ok "...said once" ;; esac
+check "...until the shortcut opens again" "$(uik @@start)" "BEGIN:VCARD"
+for i in 1 2 3 4 5; do uik Settings >/dev/null; uik Back >/dev/null; done
+check "...or iOS Settings allows more" "$(tapk '🔓 Allowed more')" "BEGIN:VCARD"
+rm -f "$DL_DIR/.logs/.no-limit"
+export DL_TAPS=100000
+uik @@start >/dev/null
 cards=$(uik Downloads)
 check "cards: a finished video shows its own picture" "$cards" "PHOTO;ENCODING=b:/9j/"
 check "cards: a stopped playlist" "$cards" "ORG;CHARSET=utf-8:Stopped · 1 of 2 videos"
@@ -504,6 +530,42 @@ u3 @@start >/dev/null
 check "a download quiet for 5 minutes is started again" "$(log_of 80)" "=== stalled: nothing for 5 minutes, so it starts again"
 for try in $(seq 20); do line_for stall.txt | grep -q ✅ && break; sleep 1; done
 check "...and carries on" "$(line_for stall.txt)" "✅ stall.txt"
+# Not while ffmpeg merges, which yt-dlp -v follows with its command line.
+nohup sh -c 'sleep 900' sh --work 81 >/dev/null 2>&1 &
+echo $! >"$DL_DIR/.logs/81.pid"
+printf 'http://127.0.0.1:%s/merge.html\n=== start\n=== via yt-dlp\n[Merger] Merging formats into "x.mp4"\n[debug] ffmpeg command line: ffmpeg -i x\n' \
+  "$port" >"$DL_DIR/.logs/81.log"
+"$systouch" -d '10 minutes ago' "$DL_DIR/.logs/81.log"
+u3 @@start >/dev/null
+case $(log_of 81) in *'=== stalled'*) fail "a merge was taken for a stalled download" ;; *) ok "...but not one that's merging" ;; esac
+kill "$(cat "$DL_DIR/.logs/81.pid")" 2>/dev/null
+rm -f "$DL_DIR/.logs/81.log" "$DL_DIR/.logs/81.pid"
+
+# Resume twice (a double tap in the live view) is one worker, not two on the same file.
+printf 'http://127.0.0.1:%s/stall.txt?twice\n=== start\n=== via aria2\n=== paused\n=== exit 143\n' "$port" >"$DL_DIR/.logs/82.log"
+nohup sh -c 'sleep 900' sh --work 82 >/dev/null 2>&1 &
+echo $! >"$DL_DIR/.logs/82.pid"
+dl --act 82 resume >/dev/null
+[ "$(grep -c '^=== start' "$DL_DIR/.logs/82.log")" = 1 ] && ok "resuming a running download doesn't start it twice" ||
+  fail "resume started a second worker: $(log_of 82)"
+kill "$(cat "$DL_DIR/.logs/82.pid")" 2>/dev/null
+rm -f "$DL_DIR/.logs/82.log" "$DL_DIR/.logs/82.pid"
+
+# Stop deletes what earlier starts left too (paused at 60%, resumed, then stopped).
+printf 'http://127.0.0.1:%s/two.html\n=== start\n=== via yt-dlp\n[download] Destination: %s/Two.mp4\n=== paused\n=== exit 143\n=== start\n=== via yt-dlp\n=== paused\n=== exit 143\n' \
+  "$port" "$DL_DIR" >"$DL_DIR/.logs/83.log"
+printf 'part\n' >"$DL_DIR/Two.mp4.part"
+dl --act 83 stop >/dev/null
+[ ! -e "$DL_DIR/Two.mp4.part" ] && ok "stop deletes what an earlier start left" || fail "Two.mp4.part is still there"
+
+# A folder whose name starts with "-" moves to Files like any other.
+mkdir -p "$DL_DIR/- Best of -"
+printf 'one\n' >"$DL_DIR/- Best of -/One.mp4"
+printf 'http://127.0.0.1:%s/best.html\n=== start\n=== via yt-dlp\nFILE: %s/- Best of -/One.mp4\n=== exit 0\n' "$port" "$DL_DIR" \
+  >"$DL_DIR/.logs/84.log"
+dl --deliver 84 >>"$DL_DIR/.logs/84.log"
+[ -e "$DL_SHARE/- Best of -/One.mp4" ] && ok "a folder named \"- …\" moves to Files" || fail "the - folder wasn't moved: $(log_of 84)"
+rm -f "$DL_DIR/.logs/84.log"
 
 # While something downloads, a loop keeps reading the location (and so iSH-AOK running).
 # BusyBox dd rewrites its arguments, so its command line reads "dd if <file>".
@@ -528,13 +590,20 @@ unset DL_LOCATION
 
 # formats.py: a video's qualities, from what yt-dlp -J prints (here, a made-up YouTube-like one).
 rows=$(python3 "$DL_FORMATS" "$here/test-data/youtube-like.json" | tr '\037' '|')
-check "formats.py: one row a resolution, H.264 first" "$rows" "video|137|1080p|H.264 · 114 MB · plays everywhere|0"
-check "...the best of the rest where there's no H.264" "$rows" "video|313|2160p|VP9 · 858 MB · may not play in Files|0"
-check "...a format with its own sound says so" "$rows" "video|18|360p|H.264 · 8.6 MB · plays everywhere|1"
+check "formats.py: one row a resolution, H.264 first" "$rows" "video|137|1080p|H.264 · 114 MB · plays everywhere · sound next|0"
+check "...the best of the rest where there's no H.264" "$rows" "video|313|2160p|VP9 · 858 MB · may not play in Files · sound next|0"
+check "...a format with its own sound says so" "$rows" "video|18|360p|H.264 · 8.6 MB · plays everywhere · with sound|1"
 check "...then the sounds, AAC first" "$(printf '%s\n' "$rows" | grep '^audio' | head -n 1)" "audio|140|AAC · 130 kbps|3.3 MB · plays everywhere"
 case $rows in *140-drc* | *storyboard* | *sb0*) fail "formats.py lists formats nobody wants: $rows" ;;
   *) ok "...without DRC copies or storyboards" ;; esac
 check "formats.py: a playlist" "$(python3 "$DL_FORMATS" "$here/test-data/playlist.json" | tr '\037' '|')" "playlist|12"
+# X has each height twice: HLS without sound, and an MP4 with it (and no codec named).
+rows=$(python3 "$DL_FORMATS" "$here/test-data/x-like.json" | tr '\037' '|')
+check "formats.py: the MP4 with its sound in it, rather than one that needs a sound added" "$rows" \
+  "video|http-2176|1080p|plays everywhere · with sound|1"
+case $rows in *hls-2176* | *hls-832*) fail "formats.py offered X's silent HLS videos too: $rows" ;;
+  *) ok "...one row a height" ;; esac
+check "...and X's sounds" "$rows" "audio|hls-audio-128000-Audio|AAC · 128 kbps|plays everywhere"
 
 # A shortcut of level 4 asks how to download a shared video: quickly, by the rule in
 # Settings, or in a quality picked from what the site has.
@@ -548,7 +617,7 @@ check "...or to choose the quality" "$cards" "N;CHARSET=utf-8:Choose the quality
 check "...or to get just its sound" "$cards" "N;CHARSET=utf-8:Audio only;;;;"
 cards=$(u4 'Choose the quality')
 check "Choose the quality lists what the site has" "$cards" "N;CHARSET=utf-8:mp4;;;;
-ORG;CHARSET=utf-8:plays everywhere;"
+ORG;CHARSET=utf-8:plays everywhere · with sound;"
 check "...under the video's title" "$cards" "N;CHARSET=utf-8:Quality test (1);;;;"
 qid=$(($(ls "$DL_DIR/.logs" | sed -n 's/^\([0-9]*\)\.log$/\1/p' | sort -n | tail -n 1) + 1))
 check "picking one starts it, then closes with a notification" "$(u4 mp4)" "@@notify:Started: Quality test (1)"
@@ -573,6 +642,26 @@ check "...and Back goes back" "$(u4 Back)" "N;CHARSET=utf-8:Choose the quality;;
 [ "$(u4 Cancel)" = @@exit ] && ok "Cancel, from the share sheet, closes" || fail "Cancel didn't close"
 [ ! -e "$DL_DIR/.logs/.choice" ] && ok "...and forgets the choice" || fail ".choice is still there"
 
+# Only what the site has: one quality is nothing to choose from.
+u4 "@@add:http://127.0.0.1:$port/quality.html?one" >/dev/null
+u4 'Choose the quality' >/dev/null
+cards=$(u4 Back)
+case $cards in *'N;CHARSET=utf-8:Choose the quality;'*) fail "Choose the quality offered with one quality: $cards" ;;
+  *) ok "a video with one quality doesn't offer to choose it" ;; esac
+check "...but a quick download still" "$cards" "N;CHARSET=utf-8:Quick download;;;;"
+u4 Cancel >/dev/null
+# A video without its sound, where the site has only one sound: no need to ask which.
+mkdir -p "$DL_DIR/.logs/.choice"
+printf '%s\n' "http://127.0.0.1:$port/quality.html?sound" >"$DL_DIR/.logs/.choice/link"
+echo share >"$DL_DIR/.logs/.choice/from"
+printf 'title\037One sound\nvideo\037v1\037720p\037H.264 · sound next\0370\naudio\037a1\037AAC · 128 kbps\037plays everywhere\n' \
+  >"$DL_DIR/.logs/.choice/rows"
+: >"$DL_DIR/.logs/.choice/done"
+one=$(($(ls "$DL_DIR/.logs" | sed -n 's/^\([0-9]*\)\.log$/\1/p' | sort -n | tail -n 1) + 1))
+check "a video picked without its sound gets the only sound there is" "$(u4 "@@again:v:v1:0")" "@@notify:Started: One sound"
+case $(sed -n 1p "$DL_DIR/.logs/$one.fmt" 2>/dev/null) in v1+a1/*) ok "...in one go" ;;
+  *) fail "#$one's format: $(cat "$DL_DIR/.logs/$one.fmt" 2>/dev/null)" ;; esac
+
 # Level 5: iOS stops a Run Command that takes long in the background ("an unknown error"),
 # so one waits only a little for the qualities, then the shortcut runs dl again by itself.
 u5() { dl -ui -b "$(b64 "$1")" -k 5-test; }
@@ -596,6 +685,43 @@ case $(cut -d' ' -f3 "/proc/$probe/stat" 2>/dev/null) in
   '' | Z) ok "...and stops looking for the qualities" ;;
   *) fail "Cancel left the search for qualities running (pid $probe)" ;;
 esac
+
+# Sharing a video again while it downloads carries that one on, rather than starting a
+# second download into the same files.
+u5 "@@add:$SLOW_PAGE?twice" >/dev/null
+twice=$(($(ls "$DL_DIR/.logs" | sed -n 's/^\([0-9]*\)\.log$/\1/p' | sort -n | tail -n 1) + 1))
+check "a video shared and downloading..." "$(u5 'Quick download')" "@@notify:Started"
+check "...shared again, isn't started twice" "$(u5 "@@add:$SLOW_PAGE?twice")" "@@notify:Already downloading"
+dl --act "$twice" pause >/dev/null
+
+# iSH-AOK keeps names escaped, so a non-English title fills its 255 bytes 3 times as fast.
+# A name the disk refuses ([Errno 36]) starts again, named after the video's id. Here a
+# title six times over is what's too long.
+long=$(($(ls "$DL_DIR/.logs" | sed -n 's/^\([0-9]*\)\.log$/\1/p' | sort -n | tail -n 1) + 1))
+DL_TITLE='%(title)s%(title)s%(title)s%(title)s%(title)s%(title)s' dl "http://127.0.0.1:$port/long.html" >/dev/null
+for try in $(seq 90); do line_for "#$long" | grep -q '✅\|⚠️' && break; sleep 1; done
+check "a name too long for the disk starts again with a short one" "$(log_of $long)" \
+  "=== the name is too long for iSH-AOK, so it starts again with a shorter one"
+check "...and finishes" "$(line_for "#$long")" "✅"
+ls "$DL_SHARE" | grep -q '^long[-0-9]*\.mp4$' && ok "...named after the video's id" ||
+  fail "no long.mp4 among: $(ls "$DL_SHARE")"
+# The reason given is the one that caused it, and the report keeps one traceback of many.
+mkdir -p "$tmp/tb"
+{ echo "http://127.0.0.1:$port/never.html"; echo "=== start"; echo "=== via yt-dlp"
+  for frag in 23 24; do
+    echo "ERROR: unable to open for writing: [Errno 36] Filename too long: 'x.part-Frag$frag.part'"
+    printf 'Traceback (most recent call last):\n  File "a.py", line 1\n    open(name)\n'
+    echo "OSError: [Errno 36] Filename too long: 'x.part-Frag$frag.part'"
+  done
+  echo "ERROR: The downloaded file is empty"; echo '  File "<frozen runpy>", line 203'; echo "=== exit 1"
+} >"$DL_DIR/.logs/999.log"
+check "a failure says why, not just that the file came out empty" "$(line_for '#999')" \
+  "failed: the name was too long for iSH-AOK"
+report=$(dl --report 999)
+[ "$(printf '%s\n' "$report" | grep -c '^Traceback')" = 1 ] && ok "...and the report keeps one traceback" ||
+  fail "the report's tracebacks: $(printf '%s\n' "$report" | grep -c '^Traceback')"
+check "...with every error line" "$report" "Filename too long: 'x.part-Frag24.part'"
+rm -f "$DL_DIR/.logs/999.log"
 
 u4 @@start >/dev/null
 u4 Settings >/dev/null
@@ -677,5 +803,14 @@ case $out in *NEWS* | *NOPE_404* | *Rabbit*) fail "cleared downloads still liste
   *) ok "cleared downloads leave the list" ;; esac
 [ -e "$DL_SHARE/NEWS" ] && ok "clearing keeps the files" || fail "NEWS was deleted"
 ls "$DL_DIR/.logs" | grep -q '\.thumb$' && fail "pictures of cleared downloads are left behind" || ok "clearing removes their pictures"
+
+# The list keeps only the newest finished downloads, from the main menu too (shares from
+# the share sheet may never open the list).
+DL_KEEP=2 dl -ui -b "$(b64 @@start)" -k 5-test >/dev/null
+finished=0
+for f in "$DL_DIR"/.logs/[0-9]*.log; do grep -q '^=== exit 0' "$f" && finished=$((finished + 1)); done
+[ "$finished" -le 3 ] && ok "the main menu keeps the list short" || fail "$finished finished downloads still listed"
+find "$DL_SHARE" -name '.*.moving' | grep -q . && fail "half-moved files were left in Files" ||
+  ok "nothing was left half-moved in Files"
 
 [ "$fails" = 0 ] && echo "All checks passed." || { echo "$fails check(s) failed."; exit 1; }
