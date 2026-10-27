@@ -71,7 +71,7 @@ is_video_site() {
 alive() {
   # pstate, not state: load's callers read $state afterwards.
   [ -n "$1" ] && [ -r "/proc/$1/stat" ] && read -r _ _ pstate _ <"/proc/$1/stat" &&
-    [ "$pstate" != Z ] && tr '\0' ' ' <"/proc/$1/cmdline" | grep -q -- "--work $2 *\$"
+    [ "$pstate" != Z ] && tr '\0' ' ' 2>/dev/null <"/proc/$1/cmdline" | grep -q -- "--work $2 *\$"
 }
 
 running() { alive "$(cat "$JOBS/$1.pid" 2>/dev/null)" "$1"; }
@@ -100,7 +100,7 @@ keep_awake() {
 
 awake() {  # is the loop running?
   pid=$(cat "$JOBS/.awake.pid" 2>/dev/null)
-  [ -n "$pid" ] && tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q -- '--awake-loop'
+  [ -n "$pid" ] && tr '\0' ' ' 2>/dev/null <"/proc/$pid/cmdline" | grep -q -- '--awake-loop'
 }
 
 # BusyBox dd rewrites its own arguments as it reads them ("if=/dev/location" becomes
@@ -135,6 +135,7 @@ rest_unless_busy() {  # rest_unless_busy <id of the download that's ending>
   for id in $(ids); do
     [ "$id" != "$1" ] && running "$id" && return 0
   done
+  probing && return 0  # finding a video's qualities (see choose)
   # The loop has a process group of its own (setsid), with its reader in it.
   if awake; then kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null; fi
   rm -f "$JOBS/.awake.pid"
@@ -145,14 +146,16 @@ rest_unless_busy() {  # rest_unless_busy <id of the download that's ending>
 # connections broke while iOS had the app suspended, and it won't carry on by itself
 # (the user's YouTube download sat at "Downloading m3u8 information"). Start it again,
 # which carries on from where it was. Not while it merges, converts or moves its file,
-# which can be quiet for longer.
+# which can be quiet for longer. Once yt-dlp has deleted what it merged, though, all that's
+# left takes seconds (one sat there for 40 minutes), and starting again finds the file
+# done.
 revive() {
   for id in $(ids); do
     running "$id" || continue
     [ -n "$(find "$JOBS" -maxdepth 1 -name "$id.log" -mmin +5 2>/dev/null)" ] || continue
     case $(tail -n 1 "$JOBS/$id.log") in
       '[Merger]'* | '[ExtractAudio]'* | '[Fixup'* | '[VideoRemuxer]'* | '[VideoConvertor]'* | \
-        'Deleting original'* | '=== moving to Files'*) continue ;;
+        '=== moving to Files'*) continue ;;
     esac
     echo "=== stalled: nothing for 5 minutes, so it starts again" >>"$JOBS/$id.log"
     pause "$id"
@@ -313,22 +316,39 @@ thumb_to() {  # thumb_to <file> <picture link>
 # rows     the qualities, from formats.py; done or failed once it's known which
 # info     what yt-dlp found (-J), which the download then starts from
 # video    the video picked, while the sound is being picked
+# asked    since when "Choose the quality" has been waiting for the qualities
 CHOICE=$JOBS/.choice
 FORMATS=${DL_FORMATS:-/usr/local/share/dl/formats.py}
+WAIT=${DL_WAIT:-12}  # how long one Run Command waits for them: iOS gives it about 30 s
 
 choose() {  # choose <link> <share|menu>: start choosing the quality for a link
-  probe_pid=$(cat "$CHOICE/pid" 2>/dev/null)
-  [ -n "$probe_pid" ] && kill -TERM -"$probe_pid" 2>/dev/null
-  rm -rf "$CHOICE"
+  end_choice
   mkdir -p "$CHOICE"
   printf '%s\n' "$1" >"$CHOICE/link"
   echo "$2" >"$CHOICE/from"
+  # Finding the qualities starts at once, so that by "Choose the quality" they may be known.
+  probe_start
+}
+
+end_choice() {  # forget the choice, and stop finding its qualities
+  stop=
+  probing && stop=$probe_pid
+  rm -rf "$CHOICE"
+  [ -n "$stop" ] || return 0
+  kill -TERM -"$stop" 2>/dev/null  # its process group (setsid): yt-dlp too
+  rest_unless_busy
 }
 
 probe_start() {  # find the qualities in the background; it can take a minute on YouTube
-  [ -e "$CHOICE/pid" ] && return 0
+  { [ -e "$CHOICE/done" ] || [ -e "$CHOICE/failed" ] || probing; } && return 0
   $(command -v setsid) nohup sh "$0" --probe >/dev/null 2>&1 </dev/null &
   echo $! >"$CHOICE/pid"
+}
+
+probing() {  # are the qualities still being found?
+  probe_pid=$(cat "$CHOICE/pid" 2>/dev/null)
+  [ -n "$probe_pid" ] && [ ! -e "$CHOICE/done" ] && [ ! -e "$CHOICE/failed" ] &&
+    tr '\0' ' ' 2>/dev/null <"/proc/$probe_pid/cmdline" | grep -q -- '--probe'
 }
 
 probe() {  # dl --probe: what probe_start runs
@@ -378,7 +398,7 @@ chosen() {
   mv -f "$CHOICE/thumb" "$JOBS/$new.thumb" 2>/dev/null
   title=$(choice_field title)
   start "$link" "$new"
-  rm -rf "$CHOICE"
+  end_choice
   finish "Started: ${title:-$(link_name "$link")}"
 }
 
@@ -919,6 +939,11 @@ act() {  # act <chosen menu line>
 #   @@share:<text>  shares the text
 # and, from level 4:
 #   @@notify:<text> shows a notification, and closes
+# and, from level 5:
+#   @@again:<key>   runs dl again at once, sending the answer back as it is: dl then acts
+#                   as if the row with that key was tapped. iOS gives iSH-AOK about 30 s
+#                   in the background, and a Run Command that takes longer fails with "an
+#                   unknown error", so a long wait is many short ones (see pick).
 # A shortcut of level 4 also sends what was shared to it as "@@add:<text>", and the link on
 # the clipboard (after @@clipboard) as "@@paste:<text>", instead of running dl -b itself,
 # so that a video can ask how to download it (see incoming).
@@ -948,14 +973,16 @@ ui() {  # ui <what was tapped>
   LEVEL=0
   [ -n "$SHORTCUT" ] && LEVEL=2
   case $SHORTCUT in [0-9]*-*) LEVEL=${SHORTCUT%%-*} ;; esac
+  by_itself=  # set when the Shortcut runs dl again by itself (@@again)
   # The page of the screen on show (see render): the same screen keeps its page.
   pageno=1
-  [ "$(sed -n 1p "$JOBS/.page" 2>/dev/null)" = "$screen" ] && pageno=$(sed -n 2p "$JOBS/.page")
+  [ -s "$JOBS/.page" ] && [ "$(sed -n 1p "$JOBS/.page")" = "$screen" ] && pageno=$(sed -n 2p "$JOBS/.page")
   before=$screen
   case $1 in
     @@start) screen=main; opening || return 0 ;;
     @@add:*) incoming "${1#@@add:}" share || return 0 ;;    # shared to the Shortcut
     @@paste:*) incoming "${1#@@paste:}" menu || return 0 ;;  # ➕, from the clipboard
+    @@again:*) by_itself=1; tapped "${1#@@again:}" || return 0 ;;  # see @@again
     '') ;;
     *) tapped "$(row_key "$1")" || return 0 ;;
   esac
@@ -1118,7 +1145,14 @@ tapped() {  # tapped <key>: act on the row tapped. Fails after printing an answe
       chosen "$(rule_format "${1#rule:}" | sed -n 1p)" "$(rule_format "${1#rule:}" | sed -n 2p)" || return 1 ;;
     pick)
       probe_start
-      probe_wait 80  # the Shortcut waits up to 120 s for this one
+      probe_wait "$WAIT"
+      # Still not known: a shortcut of level 5 asks again by itself (see @@again), for up
+      # to 5 minutes. Older ones show "Still finding…", to tap.
+      [ -n "$by_itself" ] && [ -e "$CHOICE/asked" ] || : >"$CHOICE/asked"
+      if probing && [ "$LEVEL" -ge 5 ] && [ -n "$(find "$CHOICE/asked" -mmin -5 2>/dev/null)" ]; then
+        echo @@again:pick
+        return 1
+      fi
       screen=pick ;;
     v:*)
       spec=${1#v:}
@@ -1138,7 +1172,7 @@ tapped() {  # tapped <key>: act on the row tapped. Fails after printing an answe
       esac ;;
     cancel)
       from=$(cat "$CHOICE/from" 2>/dev/null)
-      rm -rf "$CHOICE"
+      end_choice
       if [ "$from" = share ]; then echo @@exit; return 1; fi
       screen=main ;;
     quality) screen=quality ;;
@@ -1671,6 +1705,16 @@ report() {
       $0 == previous { next }
       { if (last != "") { print last; last = "" } print; previous = $0 }
       END { if (last != "") print last }' "$JOBS/$rid.log" | tail -n 300
+  fi
+  if [ -s "$CHOICE/link" ]; then
+    found="still looking"
+    [ -e "$CHOICE/done" ] && found="found $(grep -c "^\(video\|audio\)$(printf '\037')" "$CHOICE/rows")"
+    [ -e "$CHOICE/failed" ] && found="couldn't find them"
+    finding=no
+    probing && finding=yes
+    echo
+    echo "== Choosing the quality since $(date -r "$CHOICE/link" '+%H:%M:%S'): $found · finding them: $finding"
+    cat "$CHOICE/link"
   fi
   for log in .update.log .app-update.log .web.log .choice/log; do
     [ -s "$JOBS/$log" ] || continue

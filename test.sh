@@ -573,6 +573,30 @@ check "...and Back goes back" "$(u4 Back)" "N;CHARSET=utf-8:Choose the quality;;
 [ "$(u4 Cancel)" = @@exit ] && ok "Cancel, from the share sheet, closes" || fail "Cancel didn't close"
 [ ! -e "$DL_DIR/.logs/.choice" ] && ok "...and forgets the choice" || fail ".choice is still there"
 
+# Level 5: iOS stops a Run Command that takes long in the background ("an unknown error"),
+# so one waits only a little for the qualities, then the shortcut runs dl again by itself.
+u5() { dl -ui -b "$(b64 "$1")" -k 5-test; }
+printf '%s\n' 'import runpy, sys, time' 'time.sleep(4)' "sys.argv = ['$DL_FORMATS'] + sys.argv[1:]" \
+  "runpy.run_path('$DL_FORMATS', run_name='__main__')" >"$tmp/slow-formats.py"
+DL_FORMATS=$tmp/slow-formats.py u5 "@@add:http://127.0.0.1:$port/quality.html?slow" >/dev/null
+[ -s "$DL_DIR/.logs/.choice/pid" ] && ok "level 5: the qualities are looked for as soon as it asks" ||
+  fail "nothing looks for the qualities"
+check "...a Run Command waits only a little, then asks to be run again" "$(DL_WAIT=1 u5 'Choose the quality')" \
+  "@@again:pick"
+check "...a level 4 shortcut says it's still looking" "$(DL_WAIT=1 u4 'Choose the quality')" \
+  "N;CHARSET=utf-8:Still finding the qualities…;;;;"
+check "...and once they're known, they're shown" "$(u5 @@again:pick)" "N;CHARSET=utf-8:mp4;;;;"
+u5 Back >/dev/null
+[ "$(u5 Cancel)" = @@exit ] && ok "...Cancel closes" || fail "Cancel didn't close"
+DL_FORMATS=$tmp/slow-formats.py u5 "@@add:http://127.0.0.1:$port/quality.html?cancel" >/dev/null
+probe=$(cat "$DL_DIR/.logs/.choice/pid" 2>/dev/null)
+u5 Cancel >/dev/null
+sleep 1
+case $(cut -d' ' -f3 "/proc/$probe/stat" 2>/dev/null) in
+  '' | Z) ok "...and stops looking for the qualities" ;;
+  *) fail "Cancel left the search for qualities running (pid $probe)" ;;
+esac
+
 u4 @@start >/dev/null
 u4 Settings >/dev/null
 cards=$(u4 'Quick download')

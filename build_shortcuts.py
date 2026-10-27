@@ -45,7 +45,9 @@ TEAL, DOWNLOAD_GLYPH = 431817727, 59693
 # Level 3: @@web:, @@copy: and @@share:. (c1a2b4d4 was level 2; it had no level in its version.)
 # Level 4: @@notify:; it sends what's shared as @@add: and the clipboard as @@paste:, and
 # gives dl -ui 120 s.
-LEVEL = 4
+# Level 5: @@again:<key>, which runs dl -ui again at once with the answer as it is: a long
+# wait is many short Run Commands, since iOS stops a long one with "an unknown error".
+LEVEL = 5
 # If conditions, as numbered by the Shortcuts app.
 BEGINS_WITH, HAS_ANY_VALUE = 8, 100
 # Control flow: the opening action of a block, its "Otherwise", and its "End".
@@ -170,7 +172,8 @@ def aria2(version):
     acts += [if_(shared, SHORTCUT_INPUT, HAS_ANY_VALUE), add_text, set_variable("tapped", output_of(add_text, "Text")),
              control("conditional", shared, END)]
     loop = new_uuid()
-    # 120 s, the most iSH-AOK allows: finding a YouTube video's qualities takes about a minute.
+    # 120 s, the most iSH-AOK allows. iOS gives it only about 30 s in the background, though,
+    # so dl never waits long in one go (see @@again).
     ui, run = run_with_base64("dl -ui -b", variable("tapped"), f" -k {version}", timeout=120)
     answer = output_of(run, "Run Command")
     acts += [control("repeat.count", loop, START, WFRepeatCount=500), *ui]
@@ -235,6 +238,8 @@ def aria2(version):
         ("@@web:", [page, action("showwebpage", WFURL=text(output_of(page, "Updated Text"))), *again()]),
         ("@@copy:", [copied, action("setclipboard", WFInput=attachment(output_of(copied, "Updated Text"))), *again()]),
         ("@@share:", [shared, action("share", WFInput=attachment(output_of(shared, "Updated Text"))), *again()]),
+        # @@again:<key>: run dl again at once, with the answer as what was tapped.
+        ("@@again:", [set_variable("tapped", answer)]),
         ("BEGIN:VCARD", [vcards, menu, pick, title, set_variable("tapped", output_of(title, "Name"))]),
     ], [lines, choose, set_variable("tapped", output_of(choose, "Chosen Item"))])
 
